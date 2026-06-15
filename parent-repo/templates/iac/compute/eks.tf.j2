@@ -1,0 +1,101 @@
+# EKS — Kubernetes cluster with managed node group (aws provider ~> 6.0)
+resource "aws_eks_cluster" "main" {
+  name     = "{{ project_name }}-${var.environment}-eks"
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = "1.32"   # Latest stable EKS version as of provider 6.x
+
+  vpc_config {
+    subnet_ids              = concat(aws_subnet.private[*].id, aws_subnet.public[*].id)
+    endpoint_private_access = true
+    endpoint_public_access  = var.environment != "prod"   # disable public endpoint in prod
+    security_group_ids      = [aws_security_group.app.id]
+  }
+
+  # API mode is the modern authentication approach (replaces aws-auth ConfigMap)
+  access_config {
+    authentication_mode                         = "API_AND_CONFIG_MAP"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
+  kubernetes_network_config {
+    ip_family         = "ipv4"
+    service_ipv4_cidr = "172.20.0.0/16"
+  }
+
+  # Control plane logging
+  enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+  # Extended support gives 26 months instead of 14 before forced upgrade
+  upgrade_policy {
+    support_type = "EXTENDED"
+  }
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-eks"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy,
+    aws_iam_role_policy_attachment.eks_vpc_resource_controller,
+  ]
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "{{ project_name }}-${var.environment}-ng"
+  node_role_arn   = aws_iam_role.eks_node.arn
+  subnet_ids      = aws_subnet.private[*].id
+
+  # Graviton3 instances — best price/performance for general workloads
+  ami_type       = "AL2023_ARM_64_STANDARD"
+  instance_types = [var.eks_instance_type]
+  capacity_type  = "ON_DEMAND"
+
+  scaling_config {
+    desired_size = var.eks_node_count
+    max_size     = var.eks_node_count * 3
+    min_size     = 1
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  # Force update when new AMI is released (roll nodes for security patches)
+  force_update_version = false
+
+  labels = {
+    Environment = var.environment
+    NodeGroup   = "main"
+  }
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-ng"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.eks_container_registry,
+  ]
+}
+
+output "eks_cluster_name" {
+  description = "EKS cluster name (use with kubectl and aws eks update-kubeconfig)"
+  value       = aws_eks_cluster.main.name
+}
+
+output "eks_cluster_endpoint" {
+  description = "EKS API server endpoint"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "eks_cluster_ca" {
+  description = "EKS cluster certificate authority (base64)"
+  value       = aws_eks_cluster.main.certificate_authority[0].data
+  sensitive   = true
+}

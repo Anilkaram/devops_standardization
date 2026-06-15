@@ -1,0 +1,67 @@
+# Lambda — non-containerised / event-driven (aws provider ~> 6.0)
+resource "aws_lambda_function" "app" {
+  function_name = "{{ project_name }}-${var.environment}-func"
+  role          = aws_iam_role.lambda_exec.arn
+
+  # Deployment package — replace with S3 source or container image as needed
+  filename      = "lambda.zip"
+  handler       = "handler.main"
+  runtime       = "python3.13"          # Latest Python runtime as of provider 6.x
+  code_sha256   = filebase64sha256("lambda.zip")
+
+  # Graviton2 — 20% cheaper and faster than x86_64 for most workloads
+  architectures = ["arm64"]
+
+  timeout     = 30    # seconds  (max 900)
+  memory_size = 256   # MB       (min 128, max 10240)
+
+  # Configurable /tmp scratch space (512 MB – 10 240 MB)
+  ephemeral_storage {
+    size = 512
+  }
+
+  # Structured JSON logging + X-Ray active tracing
+  logging_config {
+    log_format             = "JSON"
+    application_log_level  = "INFO"
+    system_log_level       = "WARN"
+    log_group              = aws_cloudwatch_log_group.lambda.name
+  }
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  environment {
+    variables = {
+      ENVIRONMENT = var.environment
+{% if 'bedrock' in data_stores %}
+      BEDROCK_REGION = var.region
+{% endif %}
+{% if 'polly' in data_stores %}
+      POLLY_VOICE_ID = "Joanna"
+      AUDIO_BUCKET   = "{{ project_name }}-${var.environment}-audio"
+{% endif %}
+    }
+  }
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-func"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+
+  depends_on = [aws_cloudwatch_log_group.lambda]
+}
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/{{ project_name }}-${var.environment}-func"
+  retention_in_days = lookup(local.log_retention_days, var.environment, 30)
+  kms_key_id        = try(aws_kms_key.main.arn, null)
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-lambda-logs"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+}

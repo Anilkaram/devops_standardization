@@ -1,0 +1,83 @@
+project:
+  name: laker-helm
+  region: us-east-1
+  owner:  platform-team
+
+# ==========================================
+# Services
+# Flat list of all AWS and external services 
+# used across the architecture.
+# ==========================================
+services:
+  # Serverless Provisioning 
+  - api-gateway        # Receives webhook
+  - lambda             # Acknowledges request and pushes YAML
+
+  # VCS / CI/CD
+  - github             # Laker-helm repo + GitHub Actions
+
+  # Compute / Orchestration
+  - eks                # AWS EKS Cluster + Dedicated Node Group
+
+  # Networking / Ingress
+  - alb                # Internal ALB / Ingress
+
+  # Storage
+  - ebs                # Attached as PVCs (3 for Laker, 2 for Sequeler)
+
+# ==========================================
+# Connections
+# Explicit service wiring for both flows.
+# Drives conditional blocks inside templates.
+# ==========================================
+connections:
+  # --- Provisioning Pipeline Flow ---
+  - from: api-gateway
+    to:   lambda         # Webhook triggers Lambda execution
+
+  - from: lambda
+    to:   github         # Stage 2 Lambda pushes YAML to GitHub repo
+
+  - from: github
+    to:   eks            # GitHub Actions triggers Helm Install/Upgrade to EKS
+
+  - from: eks
+    to:   ebs            # Pods in Laker and Sequeler namespaces attach to EBS PVCs
+
+  # --- User Traffic Flow ---
+  - from: alb
+    to:   eks            # Host routing directs traffic to specific Pods/Namespaces
+
+# ==========================================
+# Flows
+# Metadata describing the two distinct 
+# journeys sharing this architecture.
+# ==========================================
+flows:
+  provisioning-pipeline:
+    description: "A user subscribes via webhook, hitting API Gateway. Lambda acknowledges the request and pushes configuration YAML to a GitHub repository. This triggers GitHub Actions to lint, validate AWS Auth, and deploy infrastructure to the EKS cluster via Helm."
+
+  user-traffic:
+    description: "End-user traffic enters through an Internal ALB/Ingress, which uses host routing to direct requests to the provisioned Web App, DB, and Graph containers inside the Laker and Sequeler namespaces on EKS."
+
+# ==========================================
+# Environments
+# Per-environment infrastructure sizing.
+# Written into environments/*.tfvars.example
+# ==========================================
+environments:
+  uat:
+    eks:
+      node_group_size: small         # Reduced capacity for UAT
+    alb:
+      internal_only: true            
+
+  prod:
+    eks:
+      node_group_size: large         # Dedicated nodes for production scale
+    alb:
+      internal_only: true            
+
+cicd:
+  auto_deploy:   [uat]    # push to main -> auto-deploy to UAT via GitHub Actions
+  manual_deploy: [prod]   # prod requires manual approval gate

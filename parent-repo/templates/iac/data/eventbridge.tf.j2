@@ -1,0 +1,93 @@
+# EventBridge — custom event bus with rule and optional SQS target (aws provider ~> 6.0)
+resource "aws_cloudwatch_event_bus" "main" {
+  name        = "{{ project_name }}-${var.environment}-bus"
+  description = "{{ project_name }} ${var.environment} custom event bus"
+
+  # Encrypt events at rest with CMK when KMS is in the stack
+  kms_key_identifier = try(aws_kms_key.main.arn, null)
+
+  # Dead-letter queue for failed event deliveries
+  dead_letter_config {
+    arn = aws_sqs_queue.dlq.arn
+  }
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-bus"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "main" {
+  name           = "{{ project_name }}-${var.environment}-rule"
+  event_bus_name = aws_cloudwatch_event_bus.main.name
+  description    = "Route {{ project_name }} domain events to downstream targets"
+  state          = "ENABLED"
+
+  event_pattern = jsonencode({
+    source = ["{{ project_name }}"]
+  })
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-rule"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+}
+{% if 'eventbridge->sqs' in connections %}
+# Route matched events to the SQS queue
+resource "aws_cloudwatch_event_target" "sqs" {
+  rule           = aws_cloudwatch_event_rule.main.name
+  event_bus_name = aws_cloudwatch_event_bus.main.name
+  target_id      = "sqs-target"
+  arn            = aws_sqs_queue.main.arn
+
+  # DLQ for failed target invocations
+  dead_letter_config {
+    arn = aws_sqs_queue.dlq.arn
+  }
+}
+
+# Allow EventBridge to send messages to the SQS queue
+resource "aws_sqs_queue_policy" "eventbridge" {
+  queue_url = aws_sqs_queue.main.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowEventBridgeSend"
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.main.arn
+      Condition = {
+        ArnEquals = {
+          "aws:SourceArn" = aws_cloudwatch_event_rule.main.arn
+        }
+      }
+    }]
+  })
+}
+{% endif %}
+{% if 'eventbridge->lambda' in connections %}
+# Route matched events directly to Lambda
+resource "aws_cloudwatch_event_target" "lambda" {
+  rule           = aws_cloudwatch_event_rule.main.name
+  event_bus_name = aws_cloudwatch_event_bus.main.name
+  target_id      = "lambda-target"
+  arn            = aws_lambda_function.app.arn
+}
+
+resource "aws_lambda_permission" "eventbridge" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.app.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.main.arn
+}
+{% endif %}
+
+output "eventbridge_bus_name" {
+  description = "EventBridge custom event bus name"
+  value       = aws_cloudwatch_event_bus.main.name
+}

@@ -1,0 +1,11 @@
+{
+  "projectName": "Devops_standarization_process",
+  "ticketPattern": "[A-Z]+-\\d+",
+  "gateway": "https://coding-gateway.fissionlabs.com",
+  "tools": [
+    {
+      "tool": "claude-code",
+      "scope": "project"
+    }
+  ]
+}
