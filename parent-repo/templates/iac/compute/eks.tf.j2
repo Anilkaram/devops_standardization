@@ -1,14 +1,14 @@
 # EKS — Kubernetes cluster with managed node group (aws provider ~> 6.0)
 resource "aws_eks_cluster" "main" {
   name     = "{{ project_name }}-${var.environment}-eks"
-  role_arn = aws_iam_role.eks_cluster.arn
-  version  = "1.32"   # Latest stable EKS version as of provider 6.x
+  role_arn = var.eks_cluster_role_arn
+  version  = var.eks_cluster_version
 
   vpc_config {
-    subnet_ids              = concat(aws_subnet.private[*].id, aws_subnet.public[*].id)
+    subnet_ids              = concat(var.subnet_private_ids, var.subnet_public_ids)
     endpoint_private_access = true
     endpoint_public_access  = var.environment != "prod"   # disable public endpoint in prod
-    security_group_ids      = [aws_security_group.app.id]
+    security_group_ids      = [var.security_group_id]
   }
 
   # API mode is the modern authentication approach (replaces aws-auth ConfigMap)
@@ -35,18 +35,13 @@ resource "aws_eks_cluster" "main" {
     Environment = var.environment
     CostCentre  = var.cost_centre
   }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.eks_cluster_policy,
-    aws_iam_role_policy_attachment.eks_vpc_resource_controller,
-  ]
 }
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "{{ project_name }}-${var.environment}-ng"
-  node_role_arn   = aws_iam_role.eks_node.arn
-  subnet_ids      = aws_subnet.private[*].id
+  node_role_arn   = var.eks_node_role_arn
+  subnet_ids      = var.subnet_private_ids
 
   # Graviton3 instances — best price/performance for general workloads
   ami_type       = "AL2023_ARM_64_STANDARD"
@@ -63,7 +58,6 @@ resource "aws_eks_node_group" "main" {
     max_unavailable = 1
   }
 
-  # Force update when new AMI is released (roll nodes for security patches)
   force_update_version = false
 
   labels = {
@@ -76,26 +70,4 @@ resource "aws_eks_node_group" "main" {
     Environment = var.environment
     CostCentre  = var.cost_centre
   }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.eks_worker_node_policy,
-    aws_iam_role_policy_attachment.eks_cni_policy,
-    aws_iam_role_policy_attachment.eks_container_registry,
-  ]
-}
-
-output "eks_cluster_name" {
-  description = "EKS cluster name (use with kubectl and aws eks update-kubeconfig)"
-  value       = aws_eks_cluster.main.name
-}
-
-output "eks_cluster_endpoint" {
-  description = "EKS API server endpoint"
-  value       = aws_eks_cluster.main.endpoint
-}
-
-output "eks_cluster_ca" {
-  description = "EKS cluster certificate authority (base64)"
-  value       = aws_eks_cluster.main.certificate_authority[0].data
-  sensitive   = true
 }

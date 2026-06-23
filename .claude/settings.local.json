@@ -1,0 +1,12 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://coding-gateway.fissionlabs.com/gateway/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "cv_69Fh3RGGle8JUcudxWQE_t2t-mFsu_X3oLfnhqW_jJ4",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-client-app: claude-code\nx-project: devops_standardization"
+  },
+  "model": "kimi-k-2-7-code",
+  "availableModels": [
+    "deepseek-v3-2",
+    "kimi-k-2-7-code"
+  ]
+}

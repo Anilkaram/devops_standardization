@@ -1,662 +1,530 @@
-# DevOps Greenfield Scaffold Generator — Application Guide
-
-## Overview
-
-The **DevOps Greenfield Scaffold Generator** is a command-line tool that automatically generates Terraform Infrastructure-as-Code (IaC) scaffolds from a declarative YAML configuration file (`infra.yaml`). It standardizes AWS infrastructure setup by mapping high-level service declarations to production-ready Terraform templates.
-
----
+# DevOps Standardization Tool — Application Guide
 
 ## Table of Contents
 
-1. [How It Works](#how-it-works)
-2. [Input Structure (infra.yaml)](#input-structure)
-3. [Processing Flow](#processing-flow)
-4. [Output Files](#output-files)
-5. [Service Mappings](#service-mappings)
-6. [Connection System](#connection-system)
-7. [Examples](#examples)
-8. [Validation Rules](#validation-rules)
+1. [Prerequisites](#prerequisites)
+2. [Setup](#setup)
+3. [Running the Tool](#running-the-tool)
+4. [AI Model Switching](#ai-model-switching)
+5. [infra.yaml Schema](#infrayaml-schema)
+6. [Command Reference](#command-reference)
+7. [Output Structure](#output-structure)
+8. [Applying Terraform](#applying-terraform)
+9. [decisions.md Explained](#decisionsmd-explained)
+10. [Interactive Prompts Walkthrough](#interactive-prompts-walkthrough)
+11. [GitHub Actions Pipeline](#github-actions-pipeline)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
-## How It Works
+## Prerequisites
 
-```
-infra.yaml (Input)
-      ↓
-  [Validation]
-      ↓
-  [Parse Configuration]
-      ↓
-  [Infer Connections]
-      ↓
-  [Merge Templates]
-      ↓
-  .infra/ Directory (Output)
-```
+- Python 3.10+
+- Terraform 1.5+ (only needed to apply the generated code)
+- An API key for at least one AI provider (Claude recommended)
 
-1. **Load Configuration** — Read `infra.yaml` from current directory
-2. **Validate** — Ensure required fields and valid service names
-3. **Process Services** — Categorize into compute, data, ingress, auth
-4. **Infer Connections** — Build service wiring (explicit or implicit)
-5. **Render Templates** — Use Jinja2 to generate Terraform files
-6. **Write Output** — Create `.infra/` directory structure with all files
+```bash
+pip install -r scaffold-cli/requirements.txt
+```
 
 ---
 
-## Input Structure
+## Setup
 
-### Required: `infra.yaml`
+### Step 1 — Choose your AI provider and set the key
 
-Located in the working directory where you run the CLI.
+| Provider | Env var | Default model |
+|---|---|---|
+| Claude (default) | `ANTHROPIC_API_KEY` | claude-sonnet-4-6 |
+| OpenAI | `OPENAI_API_KEY` | gpt-4o |
+| Gemini | `GOOGLE_API_KEY` | gemini-1.5-pro |
 
-#### **Project Section** (Required)
+**Windows (PowerShell):**
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+**Windows (Command Prompt):**
+```cmd
+set ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**Linux / macOS:**
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Step 2 — Decide where to run
+
+Run `main.py` from the directory where you want `.infra/` to be created. The tool looks for `infra.yaml` in the current directory.
+
+```bash
+# From your project root
+cd my-project
+python path/to/scaffold-cli/main.py init
+```
+
+Or from the testing-ground directory for experiments:
+```bash
+cd devops-scaffold-workspace/testing-ground
+python ../scaffold-cli/main.py init
+```
+
+---
+
+## Running the Tool
+
+### Path 1: Fully interactive (no infra.yaml needed)
+
+```bash
+python scaffold-cli/main.py init
+```
+
+The tool asks 8-10 questions — cloud provider, project type, compute, data stores, environments, etc. Each question includes a trade-off explanation so you can make an informed choice. All answers are written to `decisions.md`.
+
+### Path 2: infra.yaml + interactive fill-in
+
+Create a minimal `infra.yaml` and the tool fills in anything missing:
 
 ```yaml
 project:
-  name: my-app              # Lowercase, hyphens only, max 20 chars
-  region: us-east-1         # AWS region
-  owner: platform-team      # Team/owner name
-```
-
-**Validation Rules:**
-- `name`: Matches regex `^[a-z0-9][a-z0-9-]*[a-z0-9]$`
-- `region`: Must be valid AWS region
-- `owner`: Any string
-
-#### **Services Section** (Required)
-
-Flat list of all AWS services your infrastructure needs:
-
-```yaml
-services:
-  # Compute (at least one required)
-  - lambda              # Serverless functions
-  - ecs-fargate        # Container orchestration
-  - eks                # Kubernetes
-
-  # Frontend / CDN
-  - static-site        # CloudFront + S3
-
-  # Ingress
-  - alb                # Application Load Balancer
-  - api-gateway        # REST API Gateway
-
-  # Data Stores
-  - postgres           # RDS PostgreSQL
-  - mysql              # RDS MySQL
-  - redis              # ElastiCache
-  - dynamodb           # NoSQL
-  - s3                 # Object storage
-
-  # Messaging / Events
-  - sqs                # Simple Queue Service
-  - eventbridge        # Event bus
-
-  # Security / Auth
-  - cognito            # User authentication
-  - kms                # Key encryption
-
-  # AI / ML (IAM permissions only)
-  - bedrock            # Foundation models
-  - polly              # Text-to-speech
-```
-
-**Valid Services:**
-- **Compute:** `lambda`, `ecs-fargate`, `eks` (at least one required)
-- **Frontend:** `static-site`
-- **Ingress:** `alb`, `api-gateway`
-- **Databases:** `postgres`, `mysql`, `redis`, `dynamodb`, `s3`
-- **Messaging:** `sqs`, `eventbridge`
-- **Auth:** `cognito`, `kms`
-- **AI/ML:** `bedrock`, `polly`
-
-#### **Connections Section** (Optional)
-
-Explicit service-to-service wiring:
-
-```yaml
-connections:
-  - from: static-site
-    to: api-gateway
-  
-  - from: api-gateway
-    to: lambda
-  
-  - from: lambda
-    to: dynamodb
-  
-  - from: lambda
-    to: s3
-  
-  - from: sqs
-    to: lambda
-```
-
-**Format:** Each connection has:
-- `from` (service name)
-- `to` (service name)
-
-**If omitted:** The tool auto-infers connections based on:
-- Service co-presence
-- Compute target type (Lambda vs ECS vs EKS)
-- Standard AWS patterns
-
-#### **Environments Section** (Optional)
-
-Define deployment environments with environment-specific overrides:
-
-```yaml
-environments:
-  dev:
-    eks:
-      node_count: 2
-      instance_type: t3.medium
-    dynamodb:
-      billing_mode: PAY_PER_REQUEST
-    multi_az: false
-
-  staging:
-    eks:
-      node_count: 4
-      instance_type: t3.large
-    multi_az: true
-
-  prod:
-    eks:
-      node_count: 8
-      instance_type: m5.xlarge
-    multi_az: true
-```
-
-#### **CI/CD Section** (Optional)
-
-Configure auto-deployment behavior:
-
-```yaml
-cicd:
-  auto_deploy:
-    - dev
-    - staging
-    # Exclude prod for manual approval
-```
-
-#### **Flows Section** (Optional)
-
-Document service workflows/flows:
-
-```yaml
-flows:
-  user_chat_flow:
-    description: "User query → chatbot → response"
-    services:
-      - api-gateway
-      - lambda
-      - bedrock
-      - dynamodb
-  
-  admin_flow:
-    description: "Admin portal → backend → database"
-    services:
-      - static-site
-      - api-gateway
-      - lambda
-      - dynamodb
-```
-
----
-
-## Processing Flow
-
-### 1. Configuration Loading
-
-```python
-config = _load_yaml("infra.yaml")
-```
-
-- Reads YAML file
-- Parses into Python dictionary
-- Returns to main handler
-
-### 2. Validation
-
-```
-✓ project.name (lowercase, hyphens only, ≤20 chars)
-✓ project.region (required)
-✓ project.owner (required)
-✓ services list (not empty)
-✓ services are valid (all in VALID_SERVICES set)
-✓ at least one compute service (lambda | ecs-fargate | eks)
-✓ max two compute targets (only lambda+eks combination allowed)
-```
-
-### 3. Service Categorization
-
-```python
-compute_list = [s for s in services if s in COMPUTE_SERVICES]
-compute_target = compute_list[0]  # primary compute
-other_services = [s for s in services if s not in COMPUTE_SERVICES]
-data_stores = [s for s in other_services if s in DATA_TEMPLATE]
-auth_required = "cognito" in services
-```
-
-### 4. Connection Inference
-
-**If explicit connections provided:**
-```python
-connections = {
-    f"{c['from']}->{c['to']}"
-    for c in config.get("connections", [])
-}
-```
-
-**If no connections, auto-infer:**
-- Messaging chains: `eventbridge→sqs`, `sqs→lambda`, etc.
-- Ingress routes: `alb→ecs-fargate`, `api-gateway→lambda`, etc.
-- Compute→Data: `lambda→dynamodb`, `lambda→s3`, etc.
-
-### 5. Template Rendering
-
-For each template file:
-1. Load Jinja2 template from `parent-repo/templates/`
-2. Pass context variables (project name, region, services, connections, etc.)
-3. Render to Terraform code
-4. Write to output file in `.infra/` directory
-
-### 6. Output Generation
-
-```
-.infra/
-├── iac/
-│   ├── providers.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   ├── networking.tf
-│   ├── compute.tf
-│   ├── iam.tf
-│   ├── data.tf
-│   └── observability.tf
-├── cicd/
-│   └── pipeline.yml
-├── environments/
-│   ├── dev.tfvars.example
-│   ├── staging.tfvars.example
-│   └── prod.tfvars.example
-├── secrets/
-│   └── secrets-policy.yml
-└── .gitignore
-```
-
----
-
-## Output Files
-
-### Infrastructure (`.infra/iac/`)
-
-| File | Purpose | Generated From |
-|------|---------|-----------------|
-| **providers.tf** | Terraform version, AWS provider config | `providers.tf.j2` |
-| **variables.tf** | Input variables (region, environment, etc.) | `variables.tf.j2` |
-| **outputs.tf** | Export values (API Gateway URL, ELB DNS, etc.) | `outputs.tf.j2` |
-| **networking.tf** | VPC, subnets, route tables, security groups | `networking.tf.j2` |
-| **compute.tf** | Lambda, ECS, EKS, ALB, API Gateway | Compute + Ingress templates |
-| **iam.tf** | IAM roles, policies for all compute targets | IAM service templates |
-| **data.tf** | RDS, DynamoDB, S3, Redis, SQS, EventBridge | Data service templates |
-| **observability.tf** | CloudWatch logs, alarms | `observability.tf.j2` |
-
-### CI/CD (`.infra/cicd/`)
-
-| File | Purpose |
-|------|---------|
-| **pipeline.yml** | GitHub Actions workflow (or CI/CD platform definition) |
-
-### Configuration (`.infra/environments/`)
-
-| File | Purpose |
-|------|---------|
-| **dev.tfvars.example** | Example variables for dev environment |
-| **staging.tfvars.example** | Example variables for staging environment |
-| **prod.tfvars.example** | Example variables for production environment |
-
-Content template:
-```hcl
-environment = "dev"
-region      = "REPLACE_WITH_REGION"
-cost_centre = "REPLACE_WITH_COST_CENTRE"
-
-# Environment-specific settings
-eks_node_count    = 2
-eks_instance_type = "t3.medium"
-```
-
-### Secrets (`.infra/secrets/`)
-
-| File | Purpose |
-|------|---------|
-| **secrets-policy.yml** | Secrets structure and paths (AWS Secrets Manager / SSM Parameter Store) |
-
-Example:
-```yaml
-secrets:
-  - path: "/my-app/{environment}/db/password"
-    service: "AWS Secrets Manager"
-    description: "RDS master password — auto-rotated"
-  
-  - path: "/my-app/{environment}/redis/auth-token"
-    service: "AWS Secrets Manager"
-    description: "ElastiCache auth token"
-```
-
-### Root (.infra/)
-
-| File | Purpose |
-|------|---------|
-| **.gitignore** | Ignores Terraform state files, lock files, tfvars |
-
----
-
-## Service Mappings
-
-### Compute Services
-
-| Service | Description | Terraform Template |
-|---------|-------------|-------------------|
-| `lambda` | Serverless functions | `iac/compute/lambda.tf.j2` |
-| `ecs-fargate` | Container on Fargate | `iac/compute/ecs-fargate.tf.j2` |
-| `eks` | Kubernetes cluster | `iac/compute/eks.tf.j2` |
-
-### Data Services
-
-| Service | Description | Terraform Template |
-|---------|-------------|-------------------|
-| `postgres` | RDS PostgreSQL | `iac/data/rds.tf.j2` (with db_engine=postgres) |
-| `mysql` | RDS MySQL | `iac/data/rds.tf.j2` (with db_engine=mysql) |
-| `redis` | ElastiCache | `iac/data/redis.tf.j2` |
-| `dynamodb` | NoSQL | `iac/data/dynamodb.tf.j2` |
-| `s3` | Object storage | `iac/data/s3.tf.j2` |
-| `sqs` | Message queue | `iac/data/sqs.tf.j2` |
-| `eventbridge` | Event bus | `iac/data/eventbridge.tf.j2` |
-| `cognito` | User authentication | `iac/data/cognito.tf.j2` |
-| `kms` | Key encryption | `iac/data/kms.tf.j2` (auto-added if data services present) |
-
-### Ingress Services
-
-| Service | Valid Compute Targets | Terraform Template |
-|---------|----------------------|-------------------|
-| `alb` | ecs-fargate, eks | `iac/compute/alb.tf.j2` |
-| `api-gateway` | lambda, ecs-fargate, eks | `iac/compute/api-gateway.tf.j2` |
-
-### AI/ML Services
-
-| Service | Description | Output |
-|---------|-------------|--------|
-| `bedrock` | Foundation models (RAG) | IAM permissions only, no Terraform resource |
-| `polly` | Text-to-speech | IAM permissions only, no Terraform resource |
-
-### Frontend Services
-
-| Service | Description | Terraform Template |
-|---------|-------------|-------------------|
-| `static-site` | CloudFront + S3 | `iac/compute/static-site.tf.j2` |
-
----
-
-## Connection System
-
-### Explicit Connections
-
-Define exactly how services communicate:
-
-```yaml
-connections:
-  - from: api-gateway
-    to: lambda
-  
-  - from: lambda
-    to: dynamodb
-  
-  - from: sqs
-    to: lambda
-```
-
-### Auto-Inferred Connections
-
-If `connections:` section omitted, the tool infers standard patterns:
-
-**Messaging Chains:**
-- If `eventbridge` + `sqs` present → `eventbridge→sqs`
-- If `sqs` + Lambda compute → `sqs→lambda`
-- If `sqs` + ECS compute → `sqs→ecs-fargate`
-
-**Ingress Routes:**
-- If `alb` + ECS/EKS compute → `alb→ecs-fargate` or `alb→eks`
-- If `api-gateway` + Lambda compute → `api-gateway→lambda`
-
-**Compute→Data:**
-- If compute + `postgres`/`mysql`/`redis`/`dynamodb`/`s3` → `lambda→postgres`, etc.
-
-### Template Conditionals
-
-Templates use connections to conditionally render resources:
-
-```jinja2
-{% if 'api-gateway->lambda' in connections %}
-  # Render API Gateway → Lambda integration
-{% endif %}
-
-{% if 'sqs->lambda' in connections %}
-  # Render SQS → Lambda trigger
-{% endif %}
-```
-
----
-
-## Examples
-
-### Example 1: Simple Lambda API
-
-**Input: infra.yaml**
-```yaml
-project:
-  name: api-service
-  region: us-east-1
+  name: payments-api
+  region: eu-west-1
   owner: backend-team
-
-services:
-  - lambda
-  - api-gateway
-  - dynamodb
-```
-
-**Output Behavior:**
-- ✓ Generates Lambda function
-- ✓ Creates API Gateway REST endpoint
-- ✓ Sets up DynamoDB table
-- ✓ Auto-infers: `api-gateway→lambda`, `lambda→dynamodb`
-- ✓ Generates IAM: Lambda execution role + DynamoDB permissions
-
-**Generated Files:**
-```
-.infra/iac/
-├── providers.tf         (Terraform version, AWS provider)
-├── networking.tf        (VPC, subnets)
-├── compute.tf           (Lambda + API Gateway)
-├── iam.tf               (Lambda IAM role)
-├── data.tf              (DynamoDB table)
-├── variables.tf         (Input variables)
-├── outputs.tf           (API Gateway URL)
-└── observability.tf     (CloudWatch logs)
-```
-
-### Example 2: ECS with RDS & Cache
-
-**Input: infra.yaml**
-```yaml
-project:
-  name: web-app
-  region: us-west-2
-  owner: platform-team
 
 services:
   - ecs-fargate
   - alb
   - postgres
   - redis
-  - s3
 
 environments:
-  dev:
-    multi_az: false
-  prod:
-    multi_az: true
+  dev: {}
+  staging: {}
+  prod: {}
 ```
 
-**Output Behavior:**
-- ✓ ECS Fargate cluster with ALB
-- ✓ RDS PostgreSQL database
-- ✓ ElastiCache Redis cluster
-- ✓ S3 bucket
-- ✓ Auto-infers: `alb→ecs-fargate`, `ecs-fargate→postgres`, `ecs-fargate→redis`, `ecs-fargate→s3`
-- ✓ Generates environment-specific tfvars (dev, prod)
-
-### Example 3: Kubernetes Microservices
-
-**Input: infra.yaml**
-```yaml
-project:
-  name: microservices
-  region: eu-west-1
-  owner: platform-team
-
-services:
-  - eks
-  - api-gateway
-  - s3
-  - dynamodb
-  - sqs
-  - cognito
-
-connections:
-  - from: api-gateway
-    to: eks
-  
-  - from: eks
-    to: dynamodb
-  
-  - from: eks
-    to: s3
-  
-  - from: sqs
-    to: eks
-
-flows:
-  request_flow:
-    description: "API → EKS pods → DynamoDB"
-  async_flow:
-    description: "SQS → EKS workers → S3"
+Then run:
+```bash
+python scaffold-cli/main.py init
 ```
 
-**Output Behavior:**
-- ✓ EKS cluster with node groups
-- ✓ API Gateway REST endpoint
-- ✓ Explicit connections honored
-- ✓ IAM: EKS pod role + node role, DynamoDB/S3 permissions
-- ✓ Cognito user pool
-- ✓ Flows documented in context
+The tool only prompts for fields not already in the file.
+
+### Path 3: Describe in plain English
+
+```bash
+python scaffold-cli/main.py init --describe "Node.js microservice on ECS Fargate behind an ALB, PostgreSQL database, Redis for session caching, Cognito for auth, deployed to dev and prod. Small team of 3, growth stage."
+```
+
+The AI extracts all fields it can confidently determine, then the interactive prompts fill in anything remaining.
+
+### Skip all prompts
+
+```bash
+python scaffold-cli/main.py init --yes
+```
+
+Uses whatever is in `infra.yaml`. Exits with an error if required fields are missing.
+
+### Dry run
+
+```bash
+python scaffold-cli/main.py init --dry-run
+```
+
+Shows every file that would be created without writing anything.
 
 ---
 
-## Validation Rules
+## AI Model Switching
 
-### Project Metadata
+The tool uses AI for two things:
+1. Extracting config from `--describe` text
+2. Generating Terraform for services not in the static catalog
 
-| Field | Rule | Error |
-|-------|------|-------|
-| `name` | Lowercase, hyphens only, 2-20 chars | `project.name invalid: must match [a-z0-9][a-z0-9-]*[a-z0-9]` |
-| `region` | Required, non-empty | `project.region is required` |
-| `owner` | Required, non-empty | `project.owner is required` |
+### Switch provider via environment variable
 
-### Services
+```bash
+# Claude (default, recommended)
+set ANTHROPIC_API_KEY=sk-ant-...
+python scaffold-cli/main.py init
 
-| Rule | Error |
-|------|-------|
-| At least one service | `ERROR: services list is empty` |
-| All services valid | `ERROR: unknown services: [service]` |
-| At least one compute service | `ERROR: no compute target found` |
-| Max two compute services | `ERROR: too many compute targets` |
-| Compute combo: only `lambda + eks` | `ERROR: invalid compute combination` |
+# OpenAI
+set AI_PROVIDER=openai
+set OPENAI_API_KEY=sk-...
+python scaffold-cli/main.py init
 
-### Connections
+# Google Gemini
+set AI_PROVIDER=gemini
+set GOOGLE_API_KEY=AIza...
+python scaffold-cli/main.py init
+```
 
-| Rule | Error |
-|------|-------|
-| Both `from` and `to` present | Silently skipped if missing |
-| Service names valid | No explicit check, but used in templates |
+### Switch provider via CLI flag (one-off override)
 
-### Existing Scaffold
+```bash
+python scaffold-cli/main.py init --ai-provider openai
+python scaffold-cli/main.py init --ai-provider gemini
+python scaffold-cli/main.py init --ai-provider claude
+```
 
-| Scenario | Behavior |
-|----------|----------|
-| `.infra/` exists | Show warning, ask for confirmation |
-| Overwrite confirmed | Replace all `.infra/iac/*.tf` files |
-| Overwrite declined | Exit without changes |
+### Override the model version
+
+```bash
+# Override model via env var
+set AI_MODEL=gpt-4o-mini
+python scaffold-cli/main.py init
+
+# Override model via CLI flag
+python scaffold-cli/main.py init --ai-provider openai --ai-model gpt-4o-mini
+
+# Use a specific Claude model
+python scaffold-cli/main.py init --ai-model claude-haiku-4-5-20251001
+```
+
+### Check provider status
+
+```bash
+python scaffold-cli/main.py providers
+```
+
+Output example:
+```
+AI provider status:
+
+  claude     claude-sonnet-4-6              [ready]  (active)
+  openai     gpt-4o                         [OPENAI_API_KEY not set]
+  gemini     gemini-1.5-pro                 [GOOGLE_API_KEY not set]
+
+  Set AI_PROVIDER=claude|openai|gemini  and the matching API key env var.
+  Set AI_MODEL to override the default model.
+  Or pass --ai-provider / --ai-model flags to the init command.
+```
+
+### Provider precedence
+
+CLI flag `--ai-provider` > `AI_PROVIDER` env var > default (`claude`)
+
+CLI flag `--ai-model` > `AI_MODEL` env var > provider default model
+
+---
+
+## infra.yaml Schema
+
+### Full example
+
+```yaml
+project:
+  name: my-app               # Required. Lowercase, hyphens only, max 20 chars.
+  region: us-east-1          # Required. AWS region.
+  owner: platform-team       # Required. Team or owner name.
+  type: backend              # Optional. backend | frontend | data-pipeline | ai-service
+
+stage: growth                # Optional. prototype | early | growth | scale
+
+team:
+  size: small                # Optional. solo | small | medium | large
+  ops_maturity: medium       # Optional. low | medium | high
+
+runtime:
+  language: python           # Optional. python | node | go | java | ruby
+  containerised: true        # Optional. true = Docker/ECS/EKS, false = Lambda
+
+services:                    # Required. At least one compute service.
+  # Compute (at least one required)
+  - lambda
+  - ecs-fargate
+  - eks
+  - ec2
+  # Ingress
+  - alb
+  - api-gateway
+  # Data
+  - postgres
+  - mysql
+  - aurora-postgres
+  - aurora-mysql
+  - redis
+  - dynamodb
+  - s3
+  - opensearch
+  # Auth
+  - cognito
+  - kms
+  # Messaging
+  - sqs
+  - eventbridge
+  # Frontend
+  - static-site
+  # AI/ML (IAM permissions only)
+  - bedrock
+
+environments:                # Optional. Defaults to dev/staging/prod.
+  dev: {}
+  staging: {}
+  prod: {}
+
+cicd:
+  auto_deploy:               # Environments deployed automatically (no approval gate)
+    - dev
+    # staging and prod require manual approval by default
+
+auth:
+  required: true             # Shorthand to add cognito to services
+
+data:
+  stores:                    # Shorthand to add data services
+    - postgres
+    - redis
+
+flows:                       # Optional. Documents service interaction patterns.
+  user_flow:
+    description: "API request -> Lambda -> DynamoDB"
+    services:
+      - api-gateway
+      - lambda
+      - dynamodb
+
+connections:                 # Optional. Explicit service-to-service wiring.
+  - from: api-gateway
+    to: lambda
+  - from: lambda
+    to: dynamodb
+```
+
+### Valid services
+
+```
+Compute:    lambda, ecs-fargate, eks, ec2, static-site
+Ingress:    alb, api-gateway
+Databases:  postgres, mysql, aurora-postgres, aurora-mysql, redis, dynamodb, opensearch
+Storage:    s3
+Auth:       cognito, kms
+Messaging:  sqs, eventbridge
+AI/ML:      bedrock
+```
+
+Services not in this list are sent to the AI provider, which generates the Terraform file and required variables.
 
 ---
 
 ## Command Reference
 
-### Basic Usage
+### `init` — generate scaffold
 
-```bash
-# Dry-run (see what would be generated)
-python scaffold-cli/main.py --dry-run
+```
+python scaffold-cli/main.py init [OPTIONS]
 
-# Full generation (creates .infra/)
-python scaffold-cli/main.py
-
-# With confirmation prompt
-python scaffold-cli/main.py --confirm
+Options:
+  --dry-run           Preview file list without writing anything
+  --describe TEXT     Free-text description. AI extracts config from it.
+  --yes / -y          Skip interactive prompts (use infra.yaml values only)
+  --ai-provider TEXT  Override AI_PROVIDER: claude | openai | gemini
+  --ai-model TEXT     Override AI_MODEL for the selected provider
+  --help              Show help
 ```
 
-### Flags
+### `services` — list catalog
 
-| Flag | Description |
-|------|-------------|
-| `--dry-run` | Show files that would be generated without writing |
-| `--help` | Show help message |
+```
+python scaffold-cli/main.py services
+```
 
----
+Lists every service in `services_catalog.yaml`, grouped by category. Shows whether each service uses a static template or is AI-generated.
 
-## Error Handling
+### `providers` — AI provider status
 
-### Common Errors
+```
+python scaffold-cli/main.py providers
+```
 
-**Error:** `ERROR: infra.yaml not found`
-- **Cause:** Running from wrong directory
-- **Fix:** Run from directory containing `infra.yaml`
-
-**Error:** `ERROR: unknown services: ['dynamodb']`
-- **Cause:** Service name misspelled
-- **Fix:** Check spelling against valid services list
-
-**Error:** `ERROR: no compute target found`
-- **Cause:** No lambda/ecs-fargate/eks in services
-- **Fix:** Add at least one compute service
-
-**Error:** `ERROR: invalid compute combination`
-- **Cause:** Unsupported compute pair (e.g., lambda+ecs-fargate)
-- **Fix:** Use only `lambda+eks` for multi-compute
+Shows all three providers with their default model, API key status, and which one is currently active.
 
 ---
 
-## Summary
+## Output Structure
 
-| Aspect | Details |
-|--------|---------|
-| **Input** | `infra.yaml` (project, services, connections, environments) |
-| **Validation** | Project metadata, service names, compute requirements, connections |
-| **Processing** | Load → Validate → Categorize → Infer → Render → Write |
-| **Output** | `.infra/` directory with Terraform, CI/CD, config, secrets files |
-| **Connections** | Explicit (declared) or implicit (auto-inferred from service co-presence) |
-| **Extensibility** | Jinja2 templates in `parent-repo/templates/` can be customized |
+```
+.infra/
+├── provider.tf          AWS provider, Terraform version constraint, local tags
+├── main.tf              All compute resources for your services
+├── networking.tf        VPC, public/private subnets, NAT gateway, security groups
+├── iam.tf               IAM roles and least-privilege policies
+├── data.tf              Databases, caches, queues, S3 buckets
+├── observability.tf     CloudWatch log groups and alarms
+├── output.tf            Exported values (load balancer DNS, function ARN, etc.)
+├── variables.tf         Variable declarations only -- no hardcoded defaults
+├── env/
+│   ├── dev/
+│   │   ├── backend.tf              S3 + DynamoDB remote state for dev
+│   │   ├── terraform.tfvars        Actual variable values for dev
+│   │   └── terraform.tfvars.example  Copy of tfvars with placeholders
+│   ├── staging/
+│   │   └── ...
+│   └── prod/
+│       └── ...
+├── cicd/
+│   ├── pipeline.yml     Multi-stage GitHub Actions workflow
+│   └── README.md        Pipeline setup instructions
+├── secrets/
+│   └── secrets-policy.yml  Secrets Manager / SSM path definitions
+└── decisions.md         Architecture Decision Record
+```
 
+### Why variables.tf has no defaults
+
+Variable values differ between environments — a dev RDS instance uses `db.t3.micro` while prod uses `db.r6g.xlarge`. Hardcoding either value as a default would be wrong for the other environments.
+
+All actual values live in `env/{env}/terraform.tfvars`. The `variables.tf` file only declares that the variable exists.
+
+---
+
+## Applying Terraform
+
+After the scaffold is generated:
+
+```bash
+cd .infra
+
+# 1. Create the S3 bucket and DynamoDB table for remote state first
+#    (the env/dev/backend.tf file tells you the bucket name)
+
+# 2. Initialize for the target environment
+terraform init -backend-config=env/dev/backend.tf
+
+# 3. Plan
+terraform plan -var-file=env/dev/terraform.tfvars
+
+# 4. Apply
+terraform apply -var-file=env/dev/terraform.tfvars
+
+# For prod:
+terraform init -reconfigure -backend-config=env/prod/backend.tf
+terraform plan -var-file=env/prod/terraform.tfvars
+terraform apply -var-file=env/prod/terraform.tfvars
+```
+
+---
+
+## decisions.md Explained
+
+Every run appends to `.infra/decisions.md`. The file is an Architecture Decision Record (ADR) that captures what was chosen and why.
+
+Example entry:
+
+```markdown
+## Run — 2026-06-21 14:32:07 | project: payments-api
+
+### Decisions
+
+| Field | Value | Source | Reason |
+|---|---|---|---|
+| cloud.provider | aws | interactive | Only AWS is supported in v1. |
+| project.type | backend | interactive | REST/GraphQL/BFF service. |
+| compute | ecs-fargate | infra.yaml | Read from project config file. |
+| stage | growth | interactive | Scaling product with paying users. |
+
+### Warnings
+
+> [!WARNING]
+> EKS detected on a small team. EKS has significant operational overhead...
+```
+
+This file is the answer to "why was this architecture chosen?" for every future team member or audit.
+
+---
+
+## Interactive Prompts Walkthrough
+
+When you run `python scaffold-cli/main.py init` without a complete `infra.yaml`, the tool asks:
+
+1. **Cloud provider** — AWS only (v1). Exits if you choose otherwise.
+2. **Project type** — backend / frontend / data-pipeline / ai-service. Explains each.
+3. **Project name** — validates lowercase + hyphens, max 20 chars.
+4. **Stage** — prototype / early / growth / scale. Controls complexity level.
+5. **Runtime language** — python / node / go / java / ruby.
+6. **Team size and ops maturity** — used to catch anti-patterns.
+7. **AWS region** — validates against known region list.
+8. **Owner** — team or individual name for tagging.
+9. **Environments** — multiselect: dev / staging / prod.
+10. **Data stores** — multiselect: postgres / mysql / redis / dynamodb / s3 / etc.
+11. **Auth required** — adds Cognito if yes.
+12. **CI/CD auto-deploy** — which environments deploy automatically vs. require approval.
+13. **AWS account structure** — single account or separate per env (affects backend.tf).
+
+All answers are logged to `decisions.md` with their source (`interactive`, `infra.yaml`, `--describe`, or `default`).
+
+### Anti-pattern warnings
+
+The tool warns (but does not block) on:
+
+- EKS with a solo or small team ("significant operational overhead")
+- Backend with data stores but no auth ("consider adding Cognito or another auth layer")
+- EKS with low ops maturity ("EKS requires Kubernetes expertise")
+
+Warnings appear in yellow and are recorded in `decisions.md`.
+
+---
+
+## GitHub Actions Pipeline
+
+The generated `cicd/pipeline.yml` includes these jobs:
+
+| Job | Trigger | Notes |
+|---|---|---|
+| lint | Every push | Python/JS/HCL linting |
+| build | Every push | Docker build or zip package |
+| test | Every push | Unit tests |
+| tf-plan | Every push | `terraform plan` preview |
+| deploy-dev | Push to main | Auto-deploy, no approval |
+| deploy-staging | After dev | GitHub Environment gate if not in auto_deploy |
+| deploy-prod | After staging | Always requires manual approval |
+| rollback | workflow_dispatch | Rolls back any environment |
+
+### Setup required in GitHub
+
+1. Create GitHub Environments named `staging` and `prod` (Settings > Environments)
+2. Add required reviewers to each environment
+3. Set repository secrets:
+   - `AWS_ACCOUNT_ID`
+   - `AWS_REGION`
+4. Enable OIDC: add the IAM role ARN as a secret (`AWS_OIDC_ROLE_ARN`) or use the role pattern in the workflow
+
+See `cicd/README.md` in the generated output for the full setup checklist.
+
+---
+
+## Troubleshooting
+
+### "AI provider not available — skipping --describe extraction"
+
+The API key env var is not set. Run:
+```bash
+python scaffold-cli/main.py providers
+```
+This shows which keys are missing.
+
+### "ERROR: no compute target found"
+
+Your `services:` list must include at least one of: `lambda`, `ecs-fargate`, `eks`, `ec2`.
+
+### "Services not in catalog" warning (yellow)
+
+The service name is not in `services_catalog.yaml`. The tool will call the AI provider to generate the Terraform. This is intentional — it handles any AWS service.
+
+### "project.name invalid"
+
+Name must match `^[a-z0-9][a-z0-9-]*[a-z0-9]$` and be max 20 characters.
+Examples: `payments-api`, `event-processor`, `my-service`.
+
+### Windows UnicodeEncodeError
+
+If you see encoding errors in terminal output, set:
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+```
+
+### Overwrite prompt
+
+If `.infra/` already exists, the tool asks before overwriting. Use `--yes` to skip the confirmation (still asks about overwrite separately).

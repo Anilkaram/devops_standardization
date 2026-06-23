@@ -55,6 +55,11 @@ resource "aws_cloudfront_distribution" "site" {
   price_class         = "PriceClass_100"   # US, Canada, Europe (cheapest)
   comment             = "{{ project_name }}-${var.environment} static site"
 
+  {% if 'waf' in services %}
+  # WAF connection: waf -> static-site (from infra.yaml connections)
+  web_acl_id = aws_wafv2_web_acl.main.arn
+  {% endif %}
+
   origin {
     domain_name              = aws_s3_bucket.{{ pn }}_site.bucket_regional_domain_name
     origin_id                = "S3Origin"

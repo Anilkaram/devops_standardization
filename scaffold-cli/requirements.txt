@@ -7,5 +7,21 @@ PyYAML>=6.0
 # Templating engine for generating Terraform files without hardcoding
 Jinja2>=3.1.2
 
-# LLM-powered config extraction (optional — needed for --describe flag)
+# ── AI providers (install whichever you use) ──────────────────────────────────
+
+# Claude (Anthropic) — set ANTHROPIC_API_KEY
+# AI_PROVIDER=claude  AI_MODEL=claude-sonnet-4-6
 anthropic>=0.40.0
+
+# OpenAI — set OPENAI_API_KEY
+# AI_PROVIDER=openai  AI_MODEL=gpt-4o
+openai>=1.0.0
+
+# Gemini (Google) — set GOOGLE_API_KEY
+# AI_PROVIDER=gemini  AI_MODEL=gemini-2.0-flash
+google-generativeai>=0.8.0
+
+# Kimi / Moonshot AI — set MOONSHOT_API_KEY
+# AI_PROVIDER=kimi  AI_MODEL=kimi-k2.7-code
+# Uses OpenAI-compatible API (openai package above covers this — no extra install needed)
+# Base URL: https://api.moonshot.cn/v1

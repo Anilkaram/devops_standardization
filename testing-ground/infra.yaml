@@ -1,83 +1,118 @@
 project:
-  name: laker-helm
-  region: us-east-1
-  owner:  platform-team
+  name: eks-cicd-platform
+  region: us-west-2
+  owner: devops-team
+  type: container-platform
 
-# ==========================================
-# Services
-# Flat list of all AWS and external services 
-# used across the architecture.
-# ==========================================
+stage: production
+
+team:
+  size: medium
+  ops_maturity: high
+
+runtime:
+  language: python
+  containerised: true
+
+# ── Services ─────────────────────────────────────────────────────────────────
+# Mapped to actual AWS/catalog service names from the architecture diagram.
+# kubernetes-api, kubernetes-deployment, worker-nodes, pods are EKS internals
+# — they are configured via eks node groups and deployment settings below.
 services:
-  # Serverless Provisioning 
-  - api-gateway        # Receives webhook
-  - lambda             # Acknowledges request and pushes YAML
+  # Container registry — image source
+  - ecr
 
-  # VCS / CI/CD
-  - github             # Laker-helm repo + GitHub Actions
+  # Event-driven deployment trigger
+  - eventbridge           # ECR image push → EventBridge rule → Lambda
+  - sqs                   # Parallel event queue for monitoring/logging
 
-  # Compute / Orchestration
-  - eks                # AWS EKS Cluster + Dedicated Node Group
+  # Deployment automation
+  - lambda                # Deployment Function: updates Kubernetes deployment
 
-  # Networking / Ingress
-  - alb                # Internal ALB / Ingress
+  # Kubernetes platform (EKS manages API server, worker nodes, pods internally)
+  - eks
 
-  # Storage
-  - ebs                # Attached as PVCs (3 for Laker, 2 for Sequeler)
+  # Notifications & observability
+  - sns                   # Event Notification (EventBridge/Lambda → SNS → subscribers)
+  - cloudwatch            # Monitoring: Lambda errors, deployment failures, pod alarms
 
-# ==========================================
-# Connections
-# Explicit service wiring for both flows.
-# Drives conditional blocks inside templates.
-# ==========================================
+  # Security
+  - kms                   # Encrypts ECR images, CloudWatch logs, SQS messages
+  - secrets-manager       # Stores kubeconfig credentials for Lambda → EKS auth
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+auth:
+  required: true
+  method: iam             # IAM roles: Lambda execution role + EKS node role
+
+# ── Connections (matches arrows in the diagram) ───────────────────────────────
 connections:
-  # --- Provisioning Pipeline Flow ---
-  - from: api-gateway
-    to:   lambda         # Webhook triggers Lambda execution
+  # Image push → deployment trigger
+  - { from: ecr,          to: eventbridge }   # ECR push event → EventBridge rule
+  - { from: eventbridge,  to: lambda      }   # EventBridge → Lambda Deployment Function
+  - { from: eventbridge,  to: sqs         }   # EventBridge → SQS (parallel audit queue)
 
-  - from: lambda
-    to:   github         # Stage 2 Lambda pushes YAML to GitHub repo
+  # Lambda → EKS (Kubernetes API server → rolling update → pods)
+  - { from: lambda,       to: eks         }   # Lambda calls EKS Kubernetes API
+  - { from: eks,          to: ecr         }   # EKS pulls container image from ECR
 
-  - from: github
-    to:   eks            # GitHub Actions triggers Helm Install/Upgrade to EKS
+  # Notifications
+  - { from: lambda,       to: sns         }   # Lambda publishes deployment events to SNS
+  - { from: sqs,          to: sns         }   # SQS consumer publishes to SNS
 
-  - from: eks
-    to:   ebs            # Pods in Laker and Sequeler namespaces attach to EBS PVCs
+  # Observability
+  - { from: lambda,       to: cloudwatch  }   # Lambda logs + alarms
+  - { from: eks,          to: cloudwatch  }   # EKS Container Insights metrics
 
-  # --- User Traffic Flow ---
-  - from: alb
-    to:   eks            # Host routing directs traffic to specific Pods/Namespaces
+  # Security
+  - { from: kms,          to: secrets-manager } # KMS encrypts secrets
+  - { from: secrets-manager, to: lambda    }    # Lambda reads kubeconfig creds
 
-# ==========================================
-# Flows
-# Metadata describing the two distinct 
-# journeys sharing this architecture.
-# ==========================================
-flows:
-  provisioning-pipeline:
-    description: "A user subscribes via webhook, hitting API Gateway. Lambda acknowledges the request and pushes configuration YAML to a GitHub repository. This triggers GitHub Actions to lint, validate AWS Auth, and deploy infrastructure to the EKS cluster via Helm."
-
-  user-traffic:
-    description: "End-user traffic enters through an Internal ALB/Ingress, which uses host routing to direct requests to the provisioned Web App, DB, and Graph containers inside the Laker and Sequeler namespaces on EKS."
-
-# ==========================================
-# Environments
-# Per-environment infrastructure sizing.
-# Written into environments/*.tfvars.example
-# ==========================================
+# ── EKS Cluster ──────────────────────────────────────────────────────────────
+# Kubernetes API Server, Worker Nodes, and Pods are all provisioned by EKS below.
 environments:
-  uat:
+  dev:
+    multi_az: false
     eks:
-      node_group_size: small         # Reduced capacity for UAT
-    alb:
-      internal_only: true            
+      node_count: 1
+      instance_type: t3.xlarge
+    lambda:
+      memory_mb: 256
+      timeout_s: 60
+
+  uat:
+    multi_az: true
+    eks:
+      node_count: 2
+      instance_type: t3.xlarge
+    lambda:
+      memory_mb: 512
+      timeout_s: 60
 
   prod:
+    multi_az: true
     eks:
-      node_group_size: large         # Dedicated nodes for production scale
-    alb:
-      internal_only: true            
+      node_count: 3
+      instance_type: t3.xlarge
+    lambda:
+      memory_mb: 1024
+      timeout_s: 60
 
+# ── CI/CD ────────────────────────────────────────────────────────────────────
 cicd:
-  auto_deploy:   [uat]    # push to main -> auto-deploy to UAT via GitHub Actions
-  manual_deploy: [prod]   # prod requires manual approval gate
+  auto_deploy:
+    - dev
+
+# ── Flows ────────────────────────────────────────────────────────────────────
+flows:
+  deployment_flow:
+    description: "ECR image push → EventBridge → Lambda → EKS Kubernetes API → Rolling update → Pods"
+    services: [ecr, eventbridge, lambda, eks]
+
+  notification_flow:
+    description: "EventBridge/Lambda → SQS + SNS → External monitoring tool polls SNS"
+    services: [eventbridge, sqs, sns, lambda]
+
+  observability_flow:
+    description: "Lambda + EKS metrics/logs → CloudWatch alarms"
+    services: [lambda, eks, cloudwatch]
