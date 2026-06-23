@@ -5,7 +5,7 @@
 
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/app/{{ project_name }}/${var.environment}"
-  retention_in_days = {{ log_retention }}
+  retention_in_days = lookup(local.log_retention_days, var.environment, 30)
 
   {% if 'kms' in services %}
   kms_key_id = aws_kms_key.main.arn

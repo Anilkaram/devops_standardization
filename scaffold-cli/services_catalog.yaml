@@ -59,6 +59,8 @@ services:
       source: "terraform-aws-modules/lambda/aws"
       version: "~> 8.0"                   # latest 8.8.0 (Apr 2026)
     template: iac/compute/lambda.tf.j2
+    iam_templates:
+      - iac/iam/lambda.tf.j2
     iam_actions:
       - lambda:InvokeFunction
       - lambda:GetFunction
@@ -77,6 +79,8 @@ services:
       version: "~> 21.0"                  # latest 21.x (May 2026)
       kubernetes_version: "1.33"
     template: iac/compute/eks.tf.j2
+    iam_templates:
+      - iac/iam/eks.tf.j2
 
   ec2:
     category: compute

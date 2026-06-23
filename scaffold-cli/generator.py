@@ -356,7 +356,11 @@ def generate_scaffold(
 
     # Observability config
     observability  = config.get("observability", {})
-    log_retention  = observability.get("log_retention_days", 30)
+    _ret_raw      = observability.get("log_retention_days", 30)
+    log_retention = (
+        _ret_raw if isinstance(_ret_raw, dict)
+        else {"dev": _ret_raw, "staging": _ret_raw, "prod": _ret_raw}
+    )
     enable_xray    = observability.get("xray", False)
     enable_metrics = observability.get("metrics", True)
 
@@ -598,14 +602,18 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("lambda_memory_size",   "number",      "var.lambda_memory_size"),
         ("lambda_timeout",       "number",      "var.lambda_timeout"),
         # Cross-module deps — live in root iam.tf / data.tf
-        ("lambda_exec_role_arn", "string",      "aws_iam_role.lambda_exec.arn"),
-        ("kms_key_arn",          "string",      "try(aws_kms_key.main.arn, null)"),
-        ("log_retention_days",   "number",      "30"),
+        ("lambda_exec_role_arn",    "string",      "aws_iam_role.lambda_exec.arn"),
+        ("kms_key_arn",             "string",      "try(aws_kms_key.main.arn, null)"),
+        ("log_retention_days",      "number",      "30"),
+        # Optional service outputs passed in when those services are present
+        ("secrets_manager_arn",     "string",      'try(aws_secretsmanager_secret.app.arn, null)'),
+        ("sns_topic_arn",           "string",      'try(aws_sns_topic.notifications.arn, null)'),
+        ("sqs_queue_url",           "string",      'try(aws_sqs_queue.main.id, null)'),
         # Universal
-        ("environment",          "string",      "var.environment"),
-        ("region",               "string",      "var.region"),
-        ("cost_centre",          "string",      "var.cost_centre"),
-        ("tags",                 "map(string)", "local.common_tags"),
+        ("environment",             "string",      "var.environment"),
+        ("region",                  "string",      "var.region"),
+        ("cost_centre",             "string",      "var.cost_centre"),
+        ("tags",                    "map(string)", "local.common_tags"),
     ],
     "eks": [
         ("name_prefix",           "string",       '"${var.project_name}-${var.environment}"'),
@@ -698,7 +706,10 @@ def _write_module_dir(
             all_vars.append(vname)
 
     # Vars that can legally be null (passed as try(..., null) from root)
-    nullable_vars = {"kms_key_arn", "security_group_id"}
+    nullable_vars = {
+        "kms_key_arn", "security_group_id",
+        "secrets_manager_arn", "sns_topic_arn", "sqs_queue_url",
+    }
 
     var_blocks: list[str] = []
     for vname in all_vars:
@@ -1028,12 +1039,14 @@ def _write_env_files(
             tfvars_lines.append("")
             tfvars_lines.append(f"# --- Service-specific variables ---")
             seen_names: set[str] = set()
+            env_cfg = environments.get(env_name, {})
             for var in all_svc_vars:
                 name = var["name"]
                 if name in seen_names:
                     continue
                 seen_names.add(name)
-                val = dg._env_value_for(var, env_name)
+                # infra.yaml environment overrides take priority over static defaults
+                val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
                 tfvars_lines.append(_format_tfvar(name, val))
 
         (env_dir / "terraform.tfvars").write_text("\n".join(tfvars_lines) + "\n", encoding="utf-8")
@@ -1055,12 +1068,13 @@ def _write_env_files(
             example_lines.append("")
             example_lines.append("# --- Service-specific variables ---")
             seen_names = set()
+            env_cfg = environments.get(env_name, {})
             for var in all_svc_vars:
                 name = var["name"]
                 if name in seen_names:
                     continue
                 seen_names.add(name)
-                val = dg._env_value_for(var, env_name)
+                val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
                 example_lines.append(f"# {_format_tfvar(name, val)}  # {var['description']}")
 
         (env_dir / "terraform.tfvars.example").write_text("\n".join(example_lines) + "\n", encoding="utf-8")
@@ -1069,6 +1083,29 @@ def _write_env_files(
             f"  + env/{env_name}/  [backend.tf, terraform.tfvars, terraform.tfvars.example]",
             fg=typer.colors.GREEN,
         )
+
+
+def _env_override(var_name: str, env_cfg: dict):
+    """
+    Extract a value from the infra.yaml environments[env] block for a given
+    Terraform variable name. Returns None if no override is found.
+
+    Mapping: infra.yaml path -> terraform var name
+      eks.node_count     -> eks_node_count
+      eks.instance_type  -> eks_instance_type
+      lambda.memory_mb   -> lambda_memory_size
+      lambda.timeout_s   -> lambda_timeout
+    """
+    _MAP = {
+        "eks_node_count":     ("eks",    "node_count"),
+        "eks_instance_type":  ("eks",    "instance_type"),
+        "lambda_memory_size": ("lambda", "memory_mb"),
+        "lambda_timeout":     ("lambda", "timeout_s"),
+    }
+    if var_name not in _MAP:
+        return None
+    svc, key = _MAP[var_name]
+    return env_cfg.get(svc, {}).get(key)
 
 
 def _format_tfvar(name: str, value: Any) -> str:

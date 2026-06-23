@@ -1,15 +1,44 @@
-# EventBridge — custom event bus with rule and optional SQS target (aws provider ~> 6.0)
+# EventBridge — event bus, rules, and targets (aws provider ~> 6.0)
+{% if 'ecr->eventbridge' in connections %}
+# ECR push events arrive on the DEFAULT event bus — no custom bus needed.
+# A rule on the default bus forwards matching ECR Image Action events downstream.
+resource "aws_cloudwatch_event_rule" "ecr_push" {
+  name        = "{{ project_name }}-${var.environment}-ecr-push"
+  description = "Trigger deployment pipeline on ECR image PUSH"
+  state       = "ENABLED"
+
+  # Matches ECR image push events from AWS (default event bus)
+  event_pattern = jsonencode({
+    source        = ["aws.ecr"]
+    "detail-type" = ["ECR Image Action"]
+    detail = {
+      "action-type"     = ["PUSH"]
+      result            = ["SUCCESS"]
+      "repository-name" = [{ prefix = "{{ project_name }}-${var.environment}" }]
+    }
+  })
+
+  tags = {
+    Name        = "{{ project_name }}-${var.environment}-ecr-push-rule"
+    Environment = var.environment
+    CostCentre  = var.cost_centre
+  }
+}
+{% else %}
+# Generic custom event bus for application domain events
 resource "aws_cloudwatch_event_bus" "main" {
   name        = "{{ project_name }}-${var.environment}-bus"
   description = "{{ project_name }} ${var.environment} custom event bus"
 
-  # Encrypt events at rest with CMK when KMS is in the stack
+  {% if 'kms' in services %}
   kms_key_identifier = try(aws_kms_key.main.arn, null)
+  {% endif %}
 
-  # Dead-letter queue for failed event deliveries
+  {% if 'sqs' in services %}
   dead_letter_config {
     arn = aws_sqs_queue.dlq.arn
   }
+  {% endif %}
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-bus"
@@ -34,21 +63,25 @@ resource "aws_cloudwatch_event_rule" "main" {
     CostCentre  = var.cost_centre
   }
 }
-{% if 'eventbridge->sqs' in connections %}
-# Route matched events to the SQS queue
-resource "aws_cloudwatch_event_target" "sqs" {
-  rule           = aws_cloudwatch_event_rule.main.name
-  event_bus_name = aws_cloudwatch_event_bus.main.name
-  target_id      = "sqs-target"
-  arn            = aws_sqs_queue.main.arn
+{% endif %}
 
-  # DLQ for failed target invocations
+# Determine the rule name to attach targets to
+locals {
+  eventbridge_rule_name = {% if 'ecr->eventbridge' in connections %}aws_cloudwatch_event_rule.ecr_push.name{% else %}aws_cloudwatch_event_rule.main.name{% endif %}
+
+}
+{% if 'eventbridge->sqs' in connections %}
+# Route matched events to the SQS audit queue
+resource "aws_cloudwatch_event_target" "sqs" {
+  rule      = local.eventbridge_rule_name
+  target_id = "sqs-target"
+  arn       = aws_sqs_queue.main.arn
+
   dead_letter_config {
     arn = aws_sqs_queue.dlq.arn
   }
 }
 
-# Allow EventBridge to send messages to the SQS queue
 resource "aws_sqs_queue_policy" "eventbridge" {
   queue_url = aws_sqs_queue.main.id
 
@@ -62,7 +95,8 @@ resource "aws_sqs_queue_policy" "eventbridge" {
       Resource  = aws_sqs_queue.main.arn
       Condition = {
         ArnEquals = {
-          "aws:SourceArn" = aws_cloudwatch_event_rule.main.arn
+          "aws:SourceArn" = {% if 'ecr->eventbridge' in connections %}aws_cloudwatch_event_rule.ecr_push.arn{% else %}aws_cloudwatch_event_rule.main.arn{% endif %}
+
         }
       }
     }]
@@ -70,12 +104,11 @@ resource "aws_sqs_queue_policy" "eventbridge" {
 }
 {% endif %}
 {% if 'eventbridge->lambda' in connections %}
-# Route matched events directly to Lambda (lambda lives in module.lambda)
+# Route matched events to Lambda deployment worker
 resource "aws_cloudwatch_event_target" "lambda" {
-  rule           = aws_cloudwatch_event_rule.main.name
-  event_bus_name = aws_cloudwatch_event_bus.main.name
-  target_id      = "lambda-target"
-  arn            = module.lambda.function_arn
+  rule      = local.eventbridge_rule_name
+  target_id = "lambda-target"
+  arn       = module.lambda.function_arn
 }
 
 resource "aws_lambda_permission" "eventbridge" {
@@ -83,11 +116,12 @@ resource "aws_lambda_permission" "eventbridge" {
   action        = "lambda:InvokeFunction"
   function_name = module.lambda.function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.main.arn
+  source_arn    = {% if 'ecr->eventbridge' in connections %}aws_cloudwatch_event_rule.ecr_push.arn{% else %}aws_cloudwatch_event_rule.main.arn{% endif %}
+
 }
 {% endif %}
 
-output "eventbridge_bus_name" {
-  description = "EventBridge custom event bus name"
-  value       = aws_cloudwatch_event_bus.main.name
+output "eventbridge_rule_name" {
+  description = "EventBridge rule that triggers the deployment pipeline"
+  value       = local.eventbridge_rule_name
 }

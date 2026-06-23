@@ -106,8 +106,9 @@ def _normalise_config(config: dict) -> dict:
             if ds not in svcs:
                 svcs.append(ds)
 
-    # auth.required → cognito service
-    if config.get("auth", {}).get("required"):
+    # auth.required → cognito service only when method is not explicitly 'iam'
+    auth = config.get("auth", {})
+    if auth.get("required") and auth.get("method", "cognito") != "iam":
         svcs = config.setdefault("services", [])
         if "cognito" not in svcs:
             svcs.append("cognito")

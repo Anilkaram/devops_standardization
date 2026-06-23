@@ -23,6 +23,84 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+# Allow Lambda to run inside a VPC (needed when EKS endpoint is private)
+resource "aws_iam_role_policy_attachment" "lambda_vpc" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+{% if 'secrets-manager' in services %}
+# Allow Lambda to read secrets (kubeconfig, credentials)
+resource "aws_iam_role_policy" "lambda_secrets" {
+  name = "secrets-manager-read"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ReadSecrets"
+      Effect = "Allow"
+      Action = [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ]
+      Resource = "arn:aws:secretsmanager:*:*:secret:{{ project_name }}/${var.environment}/*"
+    }]
+  })
+}
+{% endif %}
+{% if 'eks' in services %}
+# Allow Lambda to describe EKS cluster (needed to build kubeconfig)
+resource "aws_iam_role_policy" "lambda_eks" {
+  name = "eks-describe"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DescribeEKS"
+      Effect = "Allow"
+      Action = ["eks:DescribeCluster"]
+      Resource = "arn:aws:eks:*:*:cluster/{{ project_name }}-${var.environment}-*"
+    }]
+  })
+}
+{% endif %}
+{% if 'sns' in services %}
+# Allow Lambda to publish deployment alerts to SNS
+resource "aws_iam_role_policy" "lambda_sns" {
+  name = "sns-publish"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "PublishSNS"
+      Effect = "Allow"
+      Action = ["sns:Publish"]
+      Resource = "arn:aws:sns:*:*:{{ project_name }}-${var.environment}-*"
+    }]
+  })
+}
+{% endif %}
+{% if 'kms' in services %}
+# Allow Lambda to use KMS CMK for decrypting secrets
+resource "aws_iam_role_policy" "lambda_kms" {
+  name = "kms-decrypt"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "KMSDecrypt"
+      Effect = "Allow"
+      Action = ["kms:Decrypt", "kms:GenerateDataKey"]
+      Resource = "arn:aws:kms:*:*:key/*"
+    }]
+  })
+}
+{% endif %}
+
 resource "aws_iam_role_policy" "lambda_deny_sensitive" {
   name = "deny-sensitive"
   role = aws_iam_role.lambda_exec.id

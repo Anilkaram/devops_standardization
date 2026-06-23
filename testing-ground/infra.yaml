@@ -15,61 +15,65 @@ runtime:
   containerised: true
 
 # ── Services ─────────────────────────────────────────────────────────────────
-# Mapped to actual AWS/catalog service names from the architecture diagram.
-# kubernetes-api, kubernetes-deployment, worker-nodes, pods are EKS internals
-# — they are configured via eks node groups and deployment settings below.
+# Direct mapping of all infrastructure components from the architecture diagram.
 services:
-  # Container registry — image source
-  - ecr
+  # Container Registry
+  - ecr                   # Stores container images; triggers deployment on push
 
-  # Event-driven deployment trigger
-  - eventbridge           # ECR image push → EventBridge rule → Lambda
-  - sqs                   # Parallel event queue for monitoring/logging
+  # Event Orchestration & Queueing
+  - eventbridge           # Detects ECR pushes and routes events
+  - sqs                   # Buffers deployment events and handles retry state
 
-  # Deployment automation
-  - lambda                # Deployment Function: updates Kubernetes deployment
+  # Compute & Deployment Automation
+  - lambda                # Execution worker that applies manifests to the EKS cluster
 
-  # Kubernetes platform (EKS manages API server, worker nodes, pods internally)
-  - eks
+  # Core Container Platform
+  - eks                   # Managed Kubernetes cluster hosting the workloads
 
-  # Notifications & observability
-  - sns                   # Event Notification (EventBridge/Lambda → SNS → subscribers)
-  - cloudwatch            # Monitoring: Lambda errors, deployment failures, pod alarms
+  # Security & Key Management
+  - kms                   # Encrypts repository images, state, and secrets
+  - secrets-manager       # Securely stores EKS cluster tokens and kubeconfig secrets
 
-  # Security
-  - kms                   # Encrypts ECR images, CloudWatch logs, SQS messages
-  - secrets-manager       # Stores kubeconfig credentials for Lambda → EKS auth
+  # Monitoring & Alerting
+  - sns                   # Dispatches pipeline status alerts to subscribers
+  - cloudwatch            # Aggregates logs and metrics from Lambda and EKS containers
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 auth:
   required: true
-  method: iam             # IAM roles: Lambda execution role + EKS node role
+  method: iam             # IAM Roles for Lambda execution and EKS authentication
 
-# ── Connections (matches arrows in the diagram) ───────────────────────────────
+# ── Connections ──────────────────────────────────────────────────────────────
+# Directional relationship matrix defining network and identity boundaries.
 connections:
-  # Image push → deployment trigger
-  - { from: ecr,          to: eventbridge }   # ECR push event → EventBridge rule
-  - { from: eventbridge,  to: lambda      }   # EventBridge → Lambda Deployment Function
-  - { from: eventbridge,  to: sqs         }   # EventBridge → SQS (parallel audit queue)
+  # Pipeline Trigger Chain
+  - { from: ecr,             to: eventbridge } # Image push emits state change event
+  - { from: eventbridge,     to: lambda      } # Routes matching rules to deployment worker
+  - { from: eventbridge,     to: sqs         } # Logs events in queue for audit trails
 
-  # Lambda → EKS (Kubernetes API server → rolling update → pods)
-  - { from: lambda,       to: eks         }   # Lambda calls EKS Kubernetes API
-  - { from: eks,          to: ecr         }   # EKS pulls container image from ECR
+  # Deployment Execution Chain
+  - { from: secrets-manager, to: lambda      } # Lambda pulls credentials to access EKS
+  - { from: lambda,          to: eks         } # Applies rolling update manifests to K8s API
+  - { from: kms,             to: secrets-manager } # KMS manages wrapper keys for secrets
 
-  # Notifications
-  - { from: lambda,       to: sns         }   # Lambda publishes deployment events to SNS
-  - { from: sqs,          to: sns         }   # SQS consumer publishes to SNS
+  # Observability & Alerting Chain
+  - { from: lambda,          to: sns         } # Notifies success/failure alerts
+  - { from: lambda,          to: cloudwatch  } # Appends function logs and runtime durations
+  - { from: eks,             to: cloudwatch  } # Container Insights captures node/pod metrics
 
-  # Observability
-  - { from: lambda,       to: cloudwatch  }   # Lambda logs + alarms
-  - { from: eks,          to: cloudwatch  }   # EKS Container Insights metrics
+# ── Flows ────────────────────────────────────────────────────────────────────
+# Logical end-to-end user and system journeys across the infrastructure.
+flows:
+  deployment_flow:
+    description: "Automated continuous delivery journey: A new container image is pushed to ECR, triggering an EventBridge rule. This invokes a Python-based Lambda function which securely fetches cluster credentials from AWS Secrets Manager, authenticates via IAM, and executes a rolling update to the EKS worker nodes."
+    services: [ecr, eventbridge, secrets-manager, lambda, eks]
 
-  # Security
-  - { from: kms,          to: secrets-manager } # KMS encrypts secrets
-  - { from: secrets-manager, to: lambda    }    # Lambda reads kubeconfig creds
+  notification_flow:
+    description: "Pipeline observability journey: Lifecycle events and runtime failures are intercepted during deployment execution. Lambda forwards status updates to SNS to alert developers, while both Lambda execution logs and EKS Container Insights metrics are unified inside CloudWatch."
+    services: [lambda, eks, sns, cloudwatch]
 
-# ── EKS Cluster ──────────────────────────────────────────────────────────────
-# Kubernetes API Server, Worker Nodes, and Pods are all provisioned by EKS below.
+# ── Environments ─────────────────────────────────────────────────────────────
+# Infrastructure topologies and compute footprint allocations per environment.
 environments:
   dev:
     multi_az: false
@@ -102,17 +106,6 @@ environments:
 cicd:
   auto_deploy:
     - dev
-
-# ── Flows ────────────────────────────────────────────────────────────────────
-flows:
-  deployment_flow:
-    description: "ECR image push → EventBridge → Lambda → EKS Kubernetes API → Rolling update → Pods"
-    services: [ecr, eventbridge, lambda, eks]
-
-  notification_flow:
-    description: "EventBridge/Lambda → SQS + SNS → External monitoring tool polls SNS"
-    services: [eventbridge, sqs, sns, lambda]
-
-  observability_flow:
-    description: "Lambda + EKS metrics/logs → CloudWatch alarms"
-    services: [lambda, eks, cloudwatch]
+  manual_deploy:
+    - uat
+    - prod

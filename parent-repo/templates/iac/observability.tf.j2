@@ -9,6 +9,7 @@ locals {
   }
 }
 
+{% if 'cloudwatch' not in services %}
 # Application log group — used by compute templates via local.log_retention_days
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/app/{{ project_name }}-${var.environment}"
@@ -21,8 +22,9 @@ resource "aws_cloudwatch_log_group" "app" {
     CostCentre  = var.cost_centre
   }
 }
+{% endif %}
 
-{% if 'lambda' in compute_target %}
+{% if 'cloudwatch' not in services and 'lambda' in compute_target %}
 # Lambda error-rate alarm
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = "{{ project_name }}-${var.environment}-lambda-errors"
@@ -98,7 +100,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   }
 }
 {% endif %}
-{% if 'ecs-fargate' in compute_target or 'eks' in services %}
+{% if 'cloudwatch' not in services and ('ecs-fargate' in compute_target or 'eks' in services) %}
 # ECS/EKS CPU alarm
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   alarm_name          = "{{ project_name }}-${var.environment}-cpu-high"
@@ -124,7 +126,7 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   }
 }
 {% endif %}
-{% if 'api-gateway' in services %}
+{% if 'cloudwatch' not in services and 'api-gateway' in services %}
 # API Gateway 5xx error alarm
 resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_name          = "{{ project_name }}-${var.environment}-api-5xx"
@@ -150,7 +152,7 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   }
 }
 {% endif %}
-{% if 'sqs' in services %}
+{% if 'cloudwatch' not in services and 'sqs' in services %}
 # SQS DLQ depth alarm — messages in DLQ means processing failures need attention
 resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
   alarm_name          = "{{ project_name }}-${var.environment}-dlq-depth"
