@@ -75,15 +75,6 @@ flows:
 # ── Environments ─────────────────────────────────────────────────────────────
 # Infrastructure topologies and compute footprint allocations per environment.
 environments:
-  dev:
-    multi_az: false
-    eks:
-      node_count: 1
-      instance_type: t3.xlarge
-    lambda:
-      memory_mb: 256
-      timeout_s: 60
-
   uat:
     multi_az: true
     eks:
