@@ -107,3 +107,6 @@ htmlcov/
 *.pid
 *.seed
 *.pid.lock
+
+
+.claude
