@@ -96,6 +96,9 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
         {"name": "lambda_s3_key",      "type": "string",
          "description": "S3 key path to the Lambda deployment zip",
          "dev": "lambda/app.zip", "staging": "lambda/app.zip", "prod": "lambda/app.zip"},
+        {"name": "log_retention_days", "type": "number",
+         "description": "CloudWatch log retention in days",
+         "dev": 7, "staging": 30, "prod": 90},
     ],
     "ecs-fargate": [
         {"name": "ecs_task_cpu",      "type": "number",
@@ -505,24 +508,28 @@ def generate_scaffold(
     if iam_blocks:
         (base / "iam.tf").write_text("\n".join(iam_blocks) + "\n", encoding="utf-8")
 
-    # "" Per-service .tf files (one file per service, not a single data.tf) ""
-    # Each service gets its own <service-name>.tf at root, e.g. sqs.tf, ecr.tf.
+    # "" Per-service modules (each service → modules/<svc>/{main,variables,outputs}.tf) ""
+    # Root main.tf gets a module call block for each service.
+    modules_dir = base / "modules"
+    modules_dir.mkdir(parents=True, exist_ok=True)
+
+    service_module_calls: list[str] = []   # collected → appended to root main.tf
     wrote_any_service = False
+
     for svc in other_services:
         if svc in ingress_keys:
             continue
 
         entry    = catalog_services.get(svc, {})
         template = entry.get("template")
-        tf_file  = base / f"{svc}.tf"
 
         if template:
             extra_vars = entry.get("extra_vars", {})
             merged     = {**ctx, **extra_vars}
             try:
                 hcl = jinja_env.get_template(template).render(**merged)
-                tf_file.write_text(hcl + "\n", encoding="utf-8")
-                typer.secho(f"  + {svc}.tf", fg=typer.colors.GREEN)
+                _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc))
                 wrote_any_service = True
             except Exception as e:
                 typer.secho(f"  ! failed {svc} ({template}): {e}", fg=typer.colors.YELLOW)
@@ -543,22 +550,41 @@ def generate_scaffold(
             )
             if result:
                 hcl, svc_vars = result
-                tf_file.write_text(hcl + "\n", encoding="utf-8")
-                typer.secho(f"  + {svc}.tf  [ai-generated]", fg=typer.colors.CYAN)
+                _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc))
+                typer.secho(f"  + modules/{svc.replace('-','_')}/  [ai-generated]",
+                            fg=typer.colors.CYAN)
                 dynamic_vars.extend(svc_vars)
                 wrote_any_service = True
 
-    # Auto-add kms.tf when KMS is needed but not explicitly listed
+        # Inject static tfvars for this service if defined
+        if svc in _SERVICE_STATIC_VARS:
+            for v in _SERVICE_STATIC_VARS[svc]:
+                if not any(d["name"] == v["name"] for d in dynamic_vars):
+                    dynamic_vars.append(v)
+
+    # Auto-add kms module when KMS is needed but not explicitly listed
     if wrote_any_service and "kms" not in services:
         kms_entry    = catalog_services.get("kms", {})
         kms_template = kms_entry.get("template")
         if kms_template:
             try:
                 hcl = jinja_env.get_template(kms_template).render(**ctx)
-                (base / "kms.tf").write_text(hcl + "\n", encoding="utf-8")
-                typer.secho("  + kms.tf  [auto-added]", fg=typer.colors.GREEN)
+                _write_service_module(modules_dir, "kms", hcl)
+                service_module_calls.append(_service_module_call("kms"))
+                typer.secho("  + modules/kms/  [auto-added]", fg=typer.colors.GREEN)
             except Exception as e:
                 typer.secho(f"  ! failed kms: {e}", fg=typer.colors.YELLOW)
+
+    # Append service module calls to root main.tf
+    if service_module_calls:
+        main_tf_path = base / "main.tf"
+        existing = main_tf_path.read_text(encoding="utf-8") if main_tf_path.exists() else ""
+        separator = "\n# ── Service Modules ─────────────────────────────────────────────────────────\n\n"
+        main_tf_path.write_text(
+            existing.rstrip() + "\n" + separator + "\n".join(service_module_calls),
+            encoding="utf-8",
+        )
 
     # "" observability.tf """"""""""""""""""""""""""""""""""""""""""""""""""
     _render(jinja_env, "iac/observability.tf.j2", base / "observability.tf", ctx)
@@ -603,12 +629,12 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("lambda_timeout",       "number",      "var.lambda_timeout"),
         # Cross-module deps — live in root iam.tf / data.tf
         ("lambda_exec_role_arn",    "string",      "aws_iam_role.lambda_exec.arn"),
-        ("kms_key_arn",             "string",      "try(aws_kms_key.main.arn, null)"),
-        ("log_retention_days",      "number",      "30"),
-        # Optional service outputs passed in when those services are present
-        ("secrets_manager_arn",     "string",      'try(aws_secretsmanager_secret.app.arn, null)'),
-        ("sns_topic_arn",           "string",      'try(aws_sns_topic.notifications.arn, null)'),
-        ("sqs_queue_url",           "string",      'try(aws_sqs_queue.main.id, null)'),
+        ("kms_key_arn",             "string",      "try(module.kms.key_arn, null)"),
+        ("log_retention_days",      "number",      "var.log_retention_days"),
+        # Optional service module outputs passed in when those services are present
+        ("secrets_manager_arn",     "string",      'try(module.secrets_manager.secret_arn, null)'),
+        ("sns_topic_arn",           "string",      'try(module.sns.topic_arn, null)'),
+        ("sqs_queue_url",           "string",      'try(module.sqs.queue_url, null)'),
         # Universal
         ("environment",             "string",      "var.environment"),
         ("region",                  "string",      "var.region"),
@@ -893,6 +919,194 @@ def _module_call_block(mod_name: str, svc_var_names: list[str]) -> str:
 
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+# Variables each service module accepts. Universal vars (project_name, environment,
+# cost_centre, tags) are added automatically — only service-specific ones listed here.
+# Format: (var_name, hcl_type, root_rhs_expression, nullable)
+_SERVICE_MODULE_VARS: dict[str, list[tuple[str, str, str, bool]]] = {
+    "sqs": [
+        ("visibility_timeout_seconds",  "number", "var.sqs_visibility_timeout",      False),
+        ("message_retention_seconds",   "number", "var.sqs_message_retention",       False),
+        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
+    ],
+    "sns": [
+        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
+    ],
+    "kms": [
+        ("deletion_window_in_days",     "number", "var.kms_deletion_window_days",   False),
+    ],
+    "ecr": [
+        ("image_tag_mutability",        "string", "var.ecr_image_tag_mutability",   False),
+        ("scan_on_push",                "bool",   "var.ecr_scan_on_push",           False),
+    ],
+    "eventbridge": [
+        ("lambda_function_arn",         "string", "try(module.lambda.function_arn, null)",   True),
+        ("lambda_function_name",        "string", "try(module.lambda.function_name, null)",  True),
+        ("sqs_queue_arn",               "string", "try(module.sqs.queue_arn, null)",         True),
+        ("sqs_dlq_arn",                 "string", "try(module.sqs.dlq_arn, null)",           True),
+    ],
+    "secrets-manager": [
+        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
+        ("recovery_window_in_days",     "number", "var.secrets_recovery_window",    False),
+    ],
+    "cloudwatch": [
+        ("log_retention_days",          "number", "var.log_retention_days",                 False),
+        ("lambda_timeout",              "number", "var.lambda_timeout",                     False),
+        ("lambda_function_name",        "string", "try(module.lambda.function_name, null)", True),
+        ("lambda_function_arn",         "string", "try(module.lambda.function_arn, null)",  True),
+        ("eks_cluster_name",            "string", "try(module.eks.cluster_name, null)",     True),
+        ("sqs_queue_arn",               "string", "try(module.sqs.queue_arn, null)",        True),
+    ],
+}
+
+# Service-specific static defaults written to tfvars (only new ones not in STATIC_SERVICE_VARS)
+_SERVICE_STATIC_VARS: dict[str, list[dict]] = {
+    "sqs": [
+        {"name": "sqs_visibility_timeout", "type": "number",
+         "description": "SQS message visibility timeout in seconds",
+         "dev": 30, "staging": 60, "prod": 60},
+        {"name": "sqs_message_retention", "type": "number",
+         "description": "SQS message retention period in seconds (86400=1d, 345600=4d)",
+         "dev": 86400, "staging": 345600, "prod": 345600},
+    ],
+    "kms": [
+        {"name": "kms_deletion_window_days", "type": "number",
+         "description": "KMS key deletion window in days (7-30)",
+         "dev": 7, "staging": 14, "prod": 30},
+    ],
+    "ecr": [
+        {"name": "ecr_image_tag_mutability", "type": "string",
+         "description": "ECR image tag mutability (MUTABLE or IMMUTABLE)",
+         "dev": "MUTABLE", "staging": "IMMUTABLE", "prod": "IMMUTABLE"},
+        {"name": "ecr_scan_on_push", "type": "bool",
+         "description": "Enable ECR vulnerability scanning on image push",
+         "dev": "false", "staging": "true", "prod": "true"},
+    ],
+    "secrets-manager": [
+        {"name": "secrets_recovery_window", "type": "number",
+         "description": "Secrets Manager recovery window before permanent deletion (days)",
+         "dev": 7, "staging": 14, "prod": 30},
+    ],
+}
+
+_UNIVERSAL_MODULE_VARS = [
+    ("project_name", "string", "var.project_name"),
+    ("environment",  "string", "var.environment"),
+    ("cost_centre",  "string", "var.cost_centre"),
+    ("tags",         "map(string)", "local.common_tags"),
+]
+
+
+def _write_service_module(
+    modules_dir: Path,
+    svc: str,
+    hcl: str,
+) -> None:
+    """
+    Write modules/<svc>/{main.tf, variables.tf, outputs.tf} for a non-compute service.
+    The HCL content (already rendered from Jinja2) becomes main.tf.
+    variables.tf is built from _UNIVERSAL_MODULE_VARS + _SERVICE_MODULE_VARS[svc].
+    outputs.tf exports key resource attributes.
+    """
+    mod_name = svc.replace("-", "_")
+    mod_dir  = modules_dir / mod_name
+    mod_dir.mkdir(parents=True, exist_ok=True)
+
+    header = (
+        f'# Module: {svc}\n'
+        f'# Called from root main.tf via: module "{mod_name}" {{ source = "./modules/{mod_name}" }}\n'
+        f'# To reuse in another project: change source to a Git URL or Terraform Registry path.\n\n'
+    )
+    (mod_dir / "main.tf").write_text(header + hcl, encoding="utf-8")
+
+    # variables.tf
+    svc_specific = _SERVICE_MODULE_VARS.get(svc, [])
+    nullable_set = {v[0] for v in svc_specific if v[3]}
+
+    var_blocks: list[str] = []
+    for vname, vtype, _ in _UNIVERSAL_MODULE_VARS:
+        var_blocks.append(f'variable "{vname}" {{\n  type = {vtype}\n}}\n')
+    for vname, vtype, _, nullable in svc_specific:
+        if nullable:
+            var_blocks.append(f'variable "{vname}" {{\n  type    = {vtype}\n  default = null\n}}\n')
+        else:
+            var_blocks.append(f'variable "{vname}" {{\n  type = {vtype}\n}}\n')
+
+    (mod_dir / "variables.tf").write_text("\n".join(var_blocks), encoding="utf-8")
+
+    # outputs.tf
+    outputs = _service_module_outputs(svc)
+    (mod_dir / "outputs.tf").write_text(outputs, encoding="utf-8")
+
+    typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
+                fg=typer.colors.CYAN)
+
+
+def _service_module_outputs(svc: str) -> str:
+    _OUTPUTS: dict[str, str] = {
+        "sqs": (
+            'output "queue_url" {\n  description = "SQS main queue URL"\n'
+            '  value       = aws_sqs_queue.main.id\n}\n\n'
+            'output "queue_arn" {\n  description = "SQS main queue ARN"\n'
+            '  value       = aws_sqs_queue.main.arn\n}\n\n'
+            'output "dlq_arn" {\n  description = "SQS dead-letter queue ARN"\n'
+            '  value       = aws_sqs_queue.dlq.arn\n}\n'
+        ),
+        "sns": (
+            'output "topic_arn" {\n  description = "SNS topic ARN"\n'
+            '  value       = aws_sns_topic.notifications.arn\n}\n\n'
+            'output "topic_name" {\n  description = "SNS topic name"\n'
+            '  value       = aws_sns_topic.notifications.name\n}\n'
+        ),
+        "kms": (
+            'output "key_arn" {\n  description = "KMS key ARN — pass to services that encrypt with this key"\n'
+            '  value       = aws_kms_key.main.arn\n}\n\n'
+            'output "key_id" {\n  description = "KMS key ID"\n'
+            '  value       = aws_kms_key.main.key_id\n}\n'
+        ),
+        "ecr": (
+            'output "repository_url" {\n  description = "ECR repository URL (use as docker push target)"\n'
+            '  value       = aws_ecr_repository.app.repository_url\n}\n\n'
+            'output "repository_arn" {\n  description = "ECR repository ARN"\n'
+            '  value       = aws_ecr_repository.app.arn\n}\n'
+        ),
+        "eventbridge": (
+            'output "rule_name" {\n  description = "EventBridge rule name"\n'
+            '  value       = local.eventbridge_rule_name\n}\n'
+        ),
+        "secrets-manager": (
+            'output "secret_arn" {\n  description = "Secrets Manager secret ARN — pass to Lambda as env var"\n'
+            '  value       = aws_secretsmanager_secret.app.arn\n}\n\n'
+            'output "secret_name" {\n  description = "Secrets Manager secret name"\n'
+            '  value       = aws_secretsmanager_secret.app.name\n}\n'
+        ),
+        "cloudwatch": (
+            'output "log_group_name" {\n  description = "Application CloudWatch log group name"\n'
+            '  value       = aws_cloudwatch_log_group.app.name\n}\n\n'
+            'output "dashboard_name" {\n  description = "CloudWatch dashboard name"\n'
+            '  value       = aws_cloudwatch_dashboard.main.dashboard_name\n}\n'
+        ),
+    }
+    return _OUTPUTS.get(svc, f'# Add outputs that root main.tf needs from the {svc} module.\n')
+
+
+def _service_module_call(svc: str) -> str:
+    """Generate the root main.tf module call block for a non-compute service module."""
+    mod_name = svc.replace("-", "_")
+    lines = [
+        f'module "{mod_name}" {{',
+        f'  source = "./modules/{mod_name}"',
+        '',
+        f'  project_name = var.project_name',
+        f'  environment  = var.environment',
+        f'  cost_centre  = var.cost_centre',
+        f'  tags         = local.common_tags',
+    ]
+    for vname, _, rhs, _ in _SERVICE_MODULE_VARS.get(svc, []):
+        lines.append(f'  {vname:<30} = {rhs}')
+    lines.append('}')
+    return '\n'.join(lines) + '\n'
 
 
 def _write_modules_scaffold(base: Path, services: list[str]) -> None:

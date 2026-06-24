@@ -1,10 +1,16 @@
 project:
-  name: eks-cicd-platform
+  name: daax-applicaiton 
   region: us-west-2
   owner: devops-team
   type: container-platform
 
 stage: production
+
+NAMING CONVENTIONS: 
+All generated AWS resource names follow this pattern:
+
+  <project_name>-<environment>-<service_name>
+  daax-applicaiton-uat-ecr
 
 team:
   size: medium

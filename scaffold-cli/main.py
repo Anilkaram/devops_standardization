@@ -338,6 +338,152 @@ def init(
     import generator
     generator.generate_scaffold(config, catalog)
 
+    # ── Write infra.yaml.example with naming conventions ─────────────────────
+    def _write_infra_example(path: Path, project_name: str) -> None:
+        content = f"""\
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# infra.yaml — scaffold-cli configuration reference
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# NAMING CONVENTIONS
+# ──────────────────
+# All generated AWS resource names follow this pattern:
+#
+#   {{project.name}}-{{environment}}-{{resource-suffix}}
+#
+# Separator rules:
+#   Hyphen   -   resource names       e.g. {project_name}-dev-func
+#   Slash    /   path-based names     e.g. {project_name}/dev/app  (Secrets Manager, log groups)
+#   Snake    _   Terraform variables  e.g. lambda_timeout, eks_node_count
+#
+# Resource name examples (using project.name = "{project_name}"):
+#
+#   Lambda function          {project_name}-dev-func
+#   Lambda IAM role          {project_name}-dev-lambda-role
+#   EKS cluster              {project_name}-dev-eks
+#   EKS cluster IAM role     {project_name}-dev-eks-cluster-role
+#   EKS node group           {project_name}-dev-ng
+#   ECR repository           {project_name}-dev-app
+#   SQS queue                {project_name}-dev-queue
+#   SQS dead-letter queue    {project_name}-dev-dlq
+#   SNS topic                {project_name}-dev-notifications
+#   KMS key alias            alias/{project_name}-dev
+#   Secrets Manager (app)    {project_name}/dev/app
+#   Secrets Manager (eks)    {project_name}/dev/eks-auth
+#   CloudWatch log group     /aws/lambda/{project_name}-dev-func
+#   CloudWatch dashboard     {project_name}-dev
+#   CloudWatch alarm         {project_name}-dev-lambda-errors
+#
+# FIELD RULES
+# ───────────
+#   project.name    Lowercase letters, digits, hyphens only. Max 20 chars.
+#                   Pattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+#                   Good:  payments-api, ai-assistant, eks-cicd-platform
+#                   Bad:   PaymentsAPI, payments_api, my app
+#
+#   project.region  Standard AWS region format.
+#                   Example: us-east-1, eu-west-1, ap-southeast-2
+#
+#   project.owner   Lowercase letters, digits, hyphens only. Max 30 chars.
+#                   Applied as a tag on every generated resource.
+#                   Example: platform-team, backend-squad, devops-team
+#
+#   services        Must match catalog entries exactly (see: scaffold-cli services).
+#                   At least one compute service required: lambda, ecs-fargate, eks, ec2.
+#
+#   connections     Use exact service names from the services list.
+#                   Format: {{ from: <service>, to: <service> }}
+#
+#   environments    Keys become the environment name in all resource names.
+#                   Lowercase, hyphens, max 10 chars per name.
+#                   Example: dev, uat, prod   (NOT Dev, PROD, production-env)
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+project:
+  name: your-project-name       # ^[a-z0-9][a-z0-9-]{{1,18}}[a-z0-9]$  max 20 chars
+  region: us-east-1             # AWS region — e.g. us-east-1, eu-west-2
+  owner: your-team-name         # kebab-case, max 30 chars — used in resource tags
+  type: backend                 # backend | frontend | full-stack | chatbot | data-pipeline | ai-service
+
+stage: prototype                # prototype | early | growth | scale
+
+team:
+  size: small                   # solo | small | medium | large
+  ops_maturity: low             # low | medium | high
+
+runtime:
+  language: python              # python | node | go | java | ruby
+  containerised: false          # true -> ECS/EKS  |  false -> Lambda/serverless
+
+# ── Services ─────────────────────────────────────────────────────────────────
+# List every AWS service to provision. Must match catalog entries exactly.
+# Run 'scaffold-cli services' to see all available options.
+# At least one compute service is required: lambda, ecs-fargate, eks, ec2
+services:
+  - lambda                      # compute  — serverless function
+  # - ecs-fargate               # compute  — managed containers
+  # - eks                       # compute  — Kubernetes cluster
+  # - api-gateway               # ingress  — REST/HTTP endpoint
+  # - cognito                   # auth     — user pool + app client
+  # - dynamodb                  # data     — key-value / document store
+  # - s3                        # data     — object storage
+  # - rds                       # data     — relational database (postgres/mysql)
+  # - sqs                       # queue    — decoupled async messaging
+  # - sns                       # notify   — fan-out pub/sub alerts
+  # - eventbridge               # events   — event routing and scheduling
+  # - kms                       # security — customer-managed encryption keys
+  # - secrets-manager           # security — encrypted secret storage
+  # - bedrock                   # ai       — foundation models + RAG
+  # - cloudwatch                # observe  — logs, alarms, dashboards
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+auth:
+  required: false               # true -> adds cognito.tf (unless method: iam)
+  method: cognito               # cognito | iam
+
+# ── Connections ──────────────────────────────────────────────────────────────
+# Define which services talk to each other.
+# Each connection wires: IAM policy on Lambda + env var injected into function.
+# Use exact service names from the services list above.
+connections:
+  - {{ from: api-gateway, to: lambda }}     # adds Lambda invoke permission
+  # - {{ from: lambda, to: dynamodb }}      # adds dynamodb:PutItem/GetItem policy + TABLE_NAME env var
+  # - {{ from: lambda, to: s3 }}            # adds s3:PutObject/GetObject policy + BUCKET_NAME env var
+  # - {{ from: lambda, to: sqs }}           # adds sqs:SendMessage policy + SQS_QUEUE_URL env var
+  # - {{ from: sqs, to: lambda }}           # adds SQS event source mapping
+  # - {{ from: lambda, to: sns }}           # adds sns:Publish policy + SNS_TOPIC_ARN env var
+  # - {{ from: lambda, to: secrets-manager }} # adds secretsmanager:GetSecretValue + ARN env var
+  # - {{ from: ecr, to: eventbridge }}      # ECR push rule on default event bus
+
+# ── Environments ─────────────────────────────────────────────────────────────
+# Keys must be: lowercase, hyphens only, max 10 chars (they appear in every resource name).
+# Values override static defaults — infra.yaml values always win over generated defaults.
+environments:
+  dev:
+    multi_az: false
+    lambda:
+      memory_mb: 256            # -> lambda_memory_size in env/dev/terraform.tfvars
+      timeout_s: 30             # -> lambda_timeout in env/dev/terraform.tfvars
+    # eks:
+    #   node_count: 1           # -> eks_node_count
+    #   instance_type: t3.medium  # -> eks_instance_type
+
+  prod:
+    multi_az: true
+    lambda:
+      memory_mb: 512
+      timeout_s: 29             # API Gateway hard limit is 29s
+
+# ── CI/CD ────────────────────────────────────────────────────────────────────
+cicd:
+  auto_deploy:
+    - dev                       # terraform apply runs automatically on push
+  manual_deploy:
+    - prod                      # requires manual approval in pipeline
+"""
+        path.write_text(content, encoding="utf-8")
+
     # ── Full pipeline (replaces simple pipeline.yml from generator) ───────────
     import pipeline_generator as pg
     auto_deploy = config.get("cicd", {}).get("auto_deploy", ["dev"])
@@ -352,9 +498,12 @@ def init(
         use_ai        = True,
     )
 
+    _write_infra_example(Path("infra.yaml.example"), name)
+
     typer.secho("\n> Done.", fg=typer.colors.GREEN, bold=True)
     typer.echo(f"  Scaffold : {INFRA_DIR.absolute()}")
     typer.echo(f"  Decisions: {decisions_path.absolute()}")
+    typer.echo(f"  Example  : infra.yaml.example  (naming conventions + field reference)")
 
 
 @app.command()
