@@ -557,9 +557,16 @@ def generate_scaffold(
                 dynamic_vars.extend(svc_vars)
                 wrote_any_service = True
 
-        # Inject static tfvars for this service if defined
-        if svc in _SERVICE_STATIC_VARS:
-            for v in _SERVICE_STATIC_VARS[svc]:
+        # Inject scalar sizing vars for this service (kms_deletion_window_days etc.)
+        _SCALAR_SVC_VARS: dict[str, list[dict]] = {
+            "kms": [
+                {"name": "kms_deletion_window_days", "type": "number",
+                 "description": "KMS key deletion window in days (7-30)",
+                 "dev": 7, "staging": 14, "prod": 30},
+            ],
+        }
+        if svc in _SCALAR_SVC_VARS:
+            for v in _SCALAR_SVC_VARS[svc]:
                 if not any(d["name"] == v["name"] for d in dynamic_vars):
                     dynamic_vars.append(v)
 
@@ -592,11 +599,14 @@ def generate_scaffold(
     # "" output.tf """""""""""""""""""""""""""""""""""""""""""""""""""""""""
     _render(jinja_env, "iac/outputs.tf.j2", base / "output.tf", ctx)
 
-    # "" variables.tf " declarations only, no hardcoded defaults """"""""""
-    _write_variables_tf(base, dynamic_vars)
+    # "" variables.tf " declarations + map(object) types """"""""""""""""""""
+    _write_variables_tf(base, dynamic_vars, services)
+
+    # "" locals.tf " cross-module ARN resolution """""""""""""""""""""""""""""
+    _write_locals_tf(base, project_name, services, connections)
 
     # "" env/{env}/ " backend.tf, terraform.tfvars, terraform.tfvars.example
-    _write_env_files(base, project_name, region, owner, environments or {}, dynamic_vars)
+    _write_env_files(base, project_name, region, owner, environments or {}, dynamic_vars, services)
 
     # "" CI/CD pipeline """"""""""""""""""""""""""""""""""""""""""""""""""""
     _render(cicd_env, "cicd/pipeline.yml.j2", base / "cicd/pipeline.yml", ctx)
@@ -921,93 +931,618 @@ def _module_call_block(mod_name: str, svc_var_names: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-# Variables each service module accepts. Universal vars (project_name, environment,
-# cost_centre, tags) are added automatically — only service-specific ones listed here.
-# Format: (var_name, hcl_type, root_rhs_expression, nullable)
-_SERVICE_MODULE_VARS: dict[str, list[tuple[str, str, str, bool]]] = {
-    "sqs": [
-        ("visibility_timeout_seconds",  "number", "var.sqs_visibility_timeout",      False),
-        ("message_retention_seconds",   "number", "var.sqs_message_retention",       False),
-        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
-    ],
-    "sns": [
-        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
-    ],
-    "kms": [
-        ("deletion_window_in_days",     "number", "var.kms_deletion_window_days",   False),
-    ],
-    "ecr": [
-        ("image_tag_mutability",        "string", "var.ecr_image_tag_mutability",   False),
-        ("scan_on_push",                "bool",   "var.ecr_scan_on_push",           False),
-    ],
-    "eventbridge": [
-        ("lambda_function_arn",         "string", "try(module.lambda.function_arn, null)",   True),
-        ("lambda_function_name",        "string", "try(module.lambda.function_name, null)",  True),
-        ("sqs_queue_arn",               "string", "try(module.sqs.queue_arn, null)",         True),
-        ("sqs_dlq_arn",                 "string", "try(module.sqs.dlq_arn, null)",           True),
-    ],
-    "secrets-manager": [
-        ("kms_key_arn",                 "string", "try(module.kms.key_arn, null)",   True),
-        ("recovery_window_in_days",     "number", "var.secrets_recovery_window",    False),
-    ],
-    "cloudwatch": [
-        ("log_retention_days",          "number", "var.log_retention_days",                 False),
-        ("lambda_timeout",              "number", "var.lambda_timeout",                     False),
-        ("lambda_function_name",        "string", "try(module.lambda.function_name, null)", True),
-        ("lambda_function_arn",         "string", "try(module.lambda.function_arn, null)",  True),
-        ("eks_cluster_name",            "string", "try(module.eks.cluster_name, null)",     True),
-        ("sqs_queue_arn",               "string", "try(module.sqs.queue_arn, null)",        True),
-    ],
+# =============================================================================
+# map(object) module pattern — matches terraform_templates reference
+# Each service module accepts a typed map variable so adding resources only
+# requires editing tfvars, never the module code itself.
+# =============================================================================
+
+# Static HCL for each service module's main.tf (for_each pattern)
+_MODULE_MAIN_HCL: dict[str, str] = {
+    "sqs": '''\
+resource "aws_sqs_queue" "queues" {
+  for_each = var.sqs_queues
+
+  name                       = each.value.name
+  visibility_timeout_seconds = each.value.visibility_timeout_seconds
+  message_retention_seconds  = each.value.message_retention_seconds
+  max_message_size           = lookup(each.value, "max_message_size", 1048576)
+  receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq[each.value.dlq_key].arn
+    maxReceiveCount     = 3
+  })
+
+  tags = merge(var.tags, { Name = each.value.name })
 }
 
-# Service-specific static defaults written to tfvars (only new ones not in STATIC_SERVICE_VARS)
-_SERVICE_STATIC_VARS: dict[str, list[dict]] = {
-    "sqs": [
-        {"name": "sqs_visibility_timeout", "type": "number",
-         "description": "SQS message visibility timeout in seconds",
-         "dev": 30, "staging": 60, "prod": 60},
-        {"name": "sqs_message_retention", "type": "number",
-         "description": "SQS message retention period in seconds (86400=1d, 345600=4d)",
-         "dev": 86400, "staging": 345600, "prod": 345600},
-    ],
-    "kms": [
-        {"name": "kms_deletion_window_days", "type": "number",
-         "description": "KMS key deletion window in days (7-30)",
-         "dev": 7, "staging": 14, "prod": 30},
-    ],
-    "ecr": [
-        {"name": "ecr_image_tag_mutability", "type": "string",
-         "description": "ECR image tag mutability (MUTABLE or IMMUTABLE)",
-         "dev": "MUTABLE", "staging": "IMMUTABLE", "prod": "IMMUTABLE"},
-        {"name": "ecr_scan_on_push", "type": "bool",
-         "description": "Enable ECR vulnerability scanning on image push",
-         "dev": "false", "staging": "true", "prod": "true"},
-    ],
-    "secrets-manager": [
-        {"name": "secrets_recovery_window", "type": "number",
-         "description": "Secrets Manager recovery window before permanent deletion (days)",
-         "dev": 7, "staging": 14, "prod": 30},
-    ],
+resource "aws_sqs_queue_redrive_allow_policy" "queues" {
+  for_each = var.sqs_queues
+
+  queue_url = aws_sqs_queue.dlq[each.value.dlq_key].id
+
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.queues[each.key].arn]
+  })
 }
 
-_UNIVERSAL_MODULE_VARS = [
-    ("project_name", "string", "var.project_name"),
-    ("environment",  "string", "var.environment"),
-    ("cost_centre",  "string", "var.cost_centre"),
-    ("tags",         "map(string)", "local.common_tags"),
-]
+resource "aws_sqs_queue" "dlq" {
+  for_each = var.dlq_queues
+
+  name                      = each.value.name
+  message_retention_seconds = each.value.message_retention_seconds
+  sqs_managed_sse_enabled   = true
+
+  tags = merge(var.tags, { Name = each.value.name })
+}
+''',
+
+    "sns": '''\
+resource "aws_sns_topic" "this" {
+  name              = var.sns.name
+  kms_master_key_id = var.kms_key_arn
+
+  tags = merge(var.tags, { Name = var.sns.name })
+}
+
+resource "aws_sns_topic_subscription" "this" {
+  for_each = var.sns.subscriptions
+
+  topic_arn = aws_sns_topic.this.arn
+  protocol  = each.value.protocol
+  endpoint  = each.value.endpoint
+}
+
+resource "aws_sns_topic_policy" "this" {
+  arn = aws_sns_topic.this.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowLambdaPublish"
+        Effect = "Allow"
+        Principal = { Service = "lambda.amazonaws.com" }
+        Action   = "SNS:Publish"
+        Resource = aws_sns_topic.this.arn
+      },
+      {
+        Sid    = "AllowEventBridgePublish"
+        Effect = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action   = "SNS:Publish"
+        Resource = aws_sns_topic.this.arn
+      }
+    ]
+  })
+}
+''',
+
+    "kms": '''\
+resource "aws_kms_key" "main" {
+  description             = var.description
+  deletion_window_in_days = var.deletion_window_in_days
+  enable_key_rotation     = true
+  key_usage               = "ENCRYPT_DECRYPT"
+  multi_region            = false
+
+  tags = merge(var.tags, { Name = var.description })
+}
+
+resource "aws_kms_alias" "main" {
+  name          = "alias/${var.key_alias}"
+  target_key_id = aws_kms_key.main.key_id
+}
+''',
+
+    "ecr": '''\
+resource "aws_ecr_repository" "repos" {
+  for_each = var.ecr_repositories
+
+  name                 = each.value.name
+  image_tag_mutability = each.value.image_tag_mutability
+
+  image_scanning_configuration {
+    scan_on_push = each.value.scan_on_push
+  }
+
+  encryption_configuration {
+    encryption_type = "KMS"
+  }
+
+  tags = merge(var.tags, { Name = each.value.name })
+}
+
+resource "aws_ecr_lifecycle_policy" "repos" {
+  for_each   = var.ecr_repositories
+  repository = aws_ecr_repository.repos[each.key].name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after 1 day"
+        selection    = { tagStatus = "untagged", countType = "sinceImagePushed", countUnit = "days", countNumber = 1 }
+        action       = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep last 30 tagged images"
+        selection    = { tagStatus = "tagged", tagPrefixList = ["v"], countType = "imageCountMoreThan", countNumber = 30 }
+        action       = { type = "expire" }
+      }
+    ]
+  })
+}
+''',
+
+    "eventbridge": '''\
+locals {
+  # Resolve lambda_key -> lambda ARN and scheduler role ARN at runtime
+  eventbridge_schedules_resolved = {
+    for k, sched in var.eventbridge_schedules :
+    k => merge(sched, {
+      lambda_arn = var.lambda_arns[sched.lambda_key]
+      role_arn   = var.scheduler_role_arn
+    })
+  }
+}
+
+resource "aws_scheduler_schedule" "this" {
+  for_each = local.eventbridge_schedules_resolved
+
+  name        = each.value.name
+  description = lookup(each.value, "description", null)
+
+  schedule_expression          = each.value.schedule_expression
+  schedule_expression_timezone = each.value.timezone
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = each.value.lambda_arn
+    role_arn = each.value.role_arn
+
+    retry_policy {
+      maximum_retry_attempts = lookup(each.value, "retry_attempts", 0)
+    }
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "ecr_push" {
+  count = var.ecr_push_rule != null ? 1 : 0
+
+  name        = var.ecr_push_rule.name
+  description = "Trigger deployment pipeline on ECR image PUSH"
+  state       = "ENABLED"
+
+  event_pattern = jsonencode({
+    source        = ["aws.ecr"]
+    "detail-type" = ["ECR Image Action"]
+    detail = {
+      "action-type"     = ["PUSH"]
+      result            = ["SUCCESS"]
+      "repository-name" = [{ prefix = var.ecr_push_rule.repo_prefix }]
+    }
+  })
+
+  tags = merge(var.tags, { Name = var.ecr_push_rule.name })
+}
+
+resource "aws_cloudwatch_event_target" "lambda" {
+  count     = var.ecr_push_rule != null && var.lambda_arns != null ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.ecr_push[0].name
+  target_id = "lambda-target"
+  arn       = values(var.lambda_arns)[0]
+}
+
+resource "aws_lambda_permission" "eventbridge" {
+  count         = var.ecr_push_rule != null && var.lambda_arns != null ? 1 : 0
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = values(var.lambda_function_names)[0]
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ecr_push[0].arn
+}
+''',
+
+    "secrets-manager": '''\
+resource "aws_secretsmanager_secret" "this" {
+  for_each = var.secrets
+
+  name                    = each.value.name
+  description             = lookup(each.value, "description", null)
+  kms_key_id              = var.kms_key_arn
+  recovery_window_in_days = lookup(each.value, "recovery_window_in_days", 7)
+
+  tags = merge(var.tags, { Name = each.value.name })
+}
+''',
+
+    "cloudwatch": '''\
+resource "aws_cloudwatch_log_group" "lambdas" {
+  for_each = var.lambda_log_groups
+
+  name              = each.value.name
+  retention_in_days = lookup(each.value, "retention_in_days", var.log_retention_days)
+
+  tags = merge(var.tags, { Name = each.value.name })
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  for_each = {
+    for k, v in var.cloudwatch_alarms.lambdas : k => v if lookup(v, "enabled", true)
+  }
+
+  alarm_name          = "${each.value.name}_errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 5
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = each.value.threshold
+
+  dimensions = { FunctionName = each.value.name }
+
+  alarm_actions = [var.sns_topic_arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
+  for_each = {
+    for k, v in var.cloudwatch_alarms.sqs : k => v if lookup(v, "enabled", true)
+  }
+
+  alarm_name          = "${each.value.name}_backlog"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = each.value.threshold
+
+  dimensions = { QueueName = each.value.name }
+
+  alarm_actions = [var.sns_topic_arn]
+}
+
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = var.dashboard.name
+  dashboard_body = jsonencode(var.dashboard.body)
+}
+''',
+}
+
+# variables.tf content for each service module (map(object) typed)
+_MODULE_VARS_TF: dict[str, str] = {
+    "sqs": '''\
+variable "sqs_queues" {
+  description = "Map of SQS queues. Adding a new queue = add one block here, no code change."
+  type = map(object({
+    name                       = string
+    message_retention_seconds  = number
+    max_message_size           = optional(number, 1048576)
+    visibility_timeout_seconds = number
+    dlq_key                    = string
+  }))
+  default = {}
+}
+
+variable "dlq_queues" {
+  description = "Map of Dead Letter Queues paired with sqs_queues entries."
+  type = map(object({
+    name                      = string
+    message_retention_seconds = number
+  }))
+  default = {}
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "sns": '''\
+variable "sns" {
+  description = "SNS topic configuration with subscriptions map."
+  type = object({
+    name = string
+    subscriptions = map(object({
+      protocol = string
+      endpoint = string
+    }))
+  })
+}
+
+variable "kms_key_arn" {
+  description = "KMS key ARN for SNS topic encryption. null = AWS-managed key."
+  type        = string
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "kms": '''\
+variable "description" {
+  description = "KMS key description (also used as Name tag)."
+  type        = string
+}
+
+variable "key_alias" {
+  description = "KMS alias name (without alias/ prefix)."
+  type        = string
+}
+
+variable "deletion_window_in_days" {
+  description = "Days before permanent key deletion (7-30). Use 7 for non-prod."
+  type        = number
+  default     = 7
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "ecr": '''\
+variable "ecr_repositories" {
+  description = "Map of ECR repositories. Add a new repo by adding one block here."
+  type = map(object({
+    name                 = string
+    image_tag_mutability = optional(string, "IMMUTABLE")
+    scan_on_push         = optional(bool, true)
+  }))
+  default = {}
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "eventbridge": '''\
+variable "eventbridge_schedules" {
+  description = "Map of EventBridge scheduler schedules. lambda_key must match a key in lambda_arns."
+  type = map(object({
+    name                = string
+    description         = optional(string)
+    schedule_expression = string
+    timezone            = string
+    lambda_key          = string
+    retry_attempts      = optional(number, 0)
+  }))
+  default = {}
+}
+
+variable "lambda_arns" {
+  description = "Map of lambda_key -> function ARN. Populated from module.lambda outputs."
+  type        = map(string)
+  default     = {}
+}
+
+variable "lambda_function_names" {
+  description = "Map of lambda_key -> function name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "scheduler_role_arn" {
+  description = "IAM role ARN that EventBridge Scheduler uses to invoke Lambda."
+  type        = string
+  default     = null
+}
+
+variable "ecr_push_rule" {
+  description = "If set, creates an EventBridge rule triggered by ECR image pushes."
+  type = object({
+    name        = string
+    repo_prefix = string
+  })
+  default = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "secrets-manager": '''\
+variable "secrets" {
+  description = "Map of secrets to create. Add a new secret by adding one block here."
+  type = map(object({
+    name                    = string
+    description             = optional(string)
+    recovery_window_in_days = optional(number, 7)
+  }))
+  default = {}
+}
+
+variable "kms_key_arn" {
+  description = "KMS key ARN used to encrypt secrets. null = AWS-managed key."
+  type        = string
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "cloudwatch": '''\
+variable "log_retention_days" {
+  description = "Default CloudWatch log retention in days."
+  type        = number
+  default     = 30
+}
+
+variable "sns_topic_arn" {
+  description = "SNS topic ARN that receives alarm notifications."
+  type        = string
+  default     = null
+}
+
+variable "lambda_log_groups" {
+  description = "Map of Lambda log groups to create."
+  type = map(object({
+    name              = string
+    retention_in_days = optional(number)
+  }))
+  default = {}
+}
+
+variable "cloudwatch_alarms" {
+  description = "Alarm definitions for Lambdas, SQS queues, and DLQs."
+  type = object({
+    lambdas = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+    sqs     = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+    dlq     = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+  })
+  default = { lambdas = {}, sqs = {}, dlq = {} }
+}
+
+variable "dashboard" {
+  description = "CloudWatch dashboard config."
+  type = object({
+    name = string
+    body = any
+  })
+  default = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+}
+
+# outputs.tf content for each service module
+_MODULE_OUTPUTS_TF: dict[str, str] = {
+    "sqs": '''\
+output "queues" {
+  description = "Map of SQS queues — keys match sqs_queues input. Each value has url and arn."
+  value = {
+    for k, q in aws_sqs_queue.queues : k => {
+      url = q.id
+      arn = q.arn
+    }
+  }
+}
+
+output "dlqs" {
+  description = "Map of DLQs — keys match dlq_queues input."
+  value = {
+    for k, q in aws_sqs_queue.dlq : k => {
+      url = q.id
+      arn = q.arn
+    }
+  }
+}
+''',
+
+    "sns": '''\
+output "topic_arn" {
+  description = "SNS topic ARN — pass to Lambda/EventBridge to publish notifications."
+  value       = aws_sns_topic.this.arn
+}
+
+output "topic_name" {
+  description = "SNS topic name."
+  value       = aws_sns_topic.this.name
+}
+''',
+
+    "kms": '''\
+output "key_arn" {
+  description = "KMS key ARN — pass to SQS, SNS, Secrets Manager as kms_key_arn."
+  value       = aws_kms_key.main.arn
+}
+
+output "key_id" {
+  description = "KMS key ID."
+  value       = aws_kms_key.main.key_id
+}
+
+output "alias_arn" {
+  description = "KMS alias ARN."
+  value       = aws_kms_alias.main.arn
+}
+''',
+
+    "ecr": '''\
+output "repositories" {
+  description = "Map of ECR repositories — keys match ecr_repositories input."
+  value = {
+    for k, r in aws_ecr_repository.repos : k => {
+      url = r.repository_url
+      arn = r.arn
+    }
+  }
+}
+''',
+
+    "eventbridge": '''\
+output "schedule_arns" {
+  description = "Map of EventBridge schedule ARNs."
+  value = {
+    for k, s in aws_scheduler_schedule.this : k => s.arn
+  }
+}
+
+output "ecr_push_rule_arn" {
+  description = "ECR push EventBridge rule ARN (null if not configured)."
+  value       = length(aws_cloudwatch_event_rule.ecr_push) > 0 ? aws_cloudwatch_event_rule.ecr_push[0].arn : null
+}
+''',
+
+    "secrets-manager": '''\
+output "secrets" {
+  description = "Map of secrets — keys match secrets input. Each value has arn and name."
+  value = {
+    for k, s in aws_secretsmanager_secret.this : k => {
+      arn  = s.arn
+      name = s.name
+    }
+  }
+}
+''',
+
+    "cloudwatch": '''\
+output "log_group_names" {
+  description = "Map of Lambda log group names."
+  value = {
+    for k, lg in aws_cloudwatch_log_group.lambdas : k => lg.name
+  }
+}
+
+output "dashboard_name" {
+  description = "CloudWatch dashboard name."
+  value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
+}
+''',
+}
 
 
-def _write_service_module(
-    modules_dir: Path,
-    svc: str,
-    hcl: str,
-) -> None:
+def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") -> None:
     """
-    Write modules/<svc>/{main.tf, variables.tf, outputs.tf} for a non-compute service.
-    The HCL content (already rendered from Jinja2) becomes main.tf.
-    variables.tf is built from _UNIVERSAL_MODULE_VARS + _SERVICE_MODULE_VARS[svc].
-    outputs.tf exports key resource attributes.
+    Write modules/<svc>/{main.tf, variables.tf, outputs.tf} using the
+    map(object) + for_each pattern matching terraform_templates reference.
+    The Jinja2-rendered HCL is replaced by static, reusable module templates.
     """
     mod_name = svc.replace("-", "_")
     mod_dir  = modules_dir / mod_name
@@ -1015,98 +1550,99 @@ def _write_service_module(
 
     header = (
         f'# Module: {svc}\n'
-        f'# Called from root main.tf via: module "{mod_name}" {{ source = "./modules/{mod_name}" }}\n'
-        f'# To reuse in another project: change source to a Git URL or Terraform Registry path.\n\n'
+        f'# source = "./modules/{mod_name}"\n'
+        f'# To reuse: change source to a Git URL or Terraform Registry path.\n'
+        f'# Add new resources by editing tfvars only — no module code changes needed.\n\n'
     )
-    (mod_dir / "main.tf").write_text(header + hcl, encoding="utf-8")
 
-    # variables.tf
-    svc_specific = _SERVICE_MODULE_VARS.get(svc, [])
-    nullable_set = {v[0] for v in svc_specific if v[3]}
+    main_hcl   = _MODULE_MAIN_HCL.get(svc, f'# TODO: add {svc} resources here\n')
+    vars_hcl   = _MODULE_VARS_TF.get(svc, 'variable "tags" { type = map(string)\n  default = {} }\n')
+    output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
-    var_blocks: list[str] = []
-    for vname, vtype, _ in _UNIVERSAL_MODULE_VARS:
-        var_blocks.append(f'variable "{vname}" {{\n  type = {vtype}\n}}\n')
-    for vname, vtype, _, nullable in svc_specific:
-        if nullable:
-            var_blocks.append(f'variable "{vname}" {{\n  type    = {vtype}\n  default = null\n}}\n')
-        else:
-            var_blocks.append(f'variable "{vname}" {{\n  type = {vtype}\n}}\n')
-
-    (mod_dir / "variables.tf").write_text("\n".join(var_blocks), encoding="utf-8")
-
-    # outputs.tf
-    outputs = _service_module_outputs(svc)
-    (mod_dir / "outputs.tf").write_text(outputs, encoding="utf-8")
+    (mod_dir / "main.tf").write_text(header + main_hcl,  encoding="utf-8")
+    (mod_dir / "variables.tf").write_text(vars_hcl,       encoding="utf-8")
+    (mod_dir / "outputs.tf").write_text(output_hcl,       encoding="utf-8")
 
     typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
                 fg=typer.colors.CYAN)
 
 
-def _service_module_outputs(svc: str) -> str:
-    _OUTPUTS: dict[str, str] = {
+def _service_module_call(svc: str) -> str:
+    """
+    Generate root main.tf module call block.
+    Passes the whole map variable — not individual scalars.
+    """
+    mod_name = svc.replace("-", "_")
+    _CALLS: dict[str, str] = {
         "sqs": (
-            'output "queue_url" {\n  description = "SQS main queue URL"\n'
-            '  value       = aws_sqs_queue.main.id\n}\n\n'
-            'output "queue_arn" {\n  description = "SQS main queue ARN"\n'
-            '  value       = aws_sqs_queue.main.arn\n}\n\n'
-            'output "dlq_arn" {\n  description = "SQS dead-letter queue ARN"\n'
-            '  value       = aws_sqs_queue.dlq.arn\n}\n'
+            f'module "sqs" {{\n'
+            f'  source = "./modules/sqs"\n\n'
+            f'  sqs_queues = var.sqs_queues\n'
+            f'  dlq_queues = var.dlq_queues\n'
+            f'  tags       = local.common_tags\n'
+            f'}}\n'
         ),
         "sns": (
-            'output "topic_arn" {\n  description = "SNS topic ARN"\n'
-            '  value       = aws_sns_topic.notifications.arn\n}\n\n'
-            'output "topic_name" {\n  description = "SNS topic name"\n'
-            '  value       = aws_sns_topic.notifications.name\n}\n'
+            f'module "sns" {{\n'
+            f'  source = "./modules/sns"\n\n'
+            f'  sns         = var.sns\n'
+            f'  kms_key_arn = try(module.kms.key_arn, null)\n'
+            f'  tags        = local.common_tags\n'
+            f'}}\n'
         ),
         "kms": (
-            'output "key_arn" {\n  description = "KMS key ARN — pass to services that encrypt with this key"\n'
-            '  value       = aws_kms_key.main.arn\n}\n\n'
-            'output "key_id" {\n  description = "KMS key ID"\n'
-            '  value       = aws_kms_key.main.key_id\n}\n'
+            f'module "kms" {{\n'
+            f'  source = "./modules/kms"\n\n'
+            f'  description             = "${{var.project_name}}-${{var.environment}} CMK"\n'
+            f'  key_alias               = "${{var.project_name}}-${{var.environment}}"\n'
+            f'  deletion_window_in_days = var.kms_deletion_window_days\n'
+            f'  tags                    = local.common_tags\n'
+            f'}}\n'
         ),
         "ecr": (
-            'output "repository_url" {\n  description = "ECR repository URL (use as docker push target)"\n'
-            '  value       = aws_ecr_repository.app.repository_url\n}\n\n'
-            'output "repository_arn" {\n  description = "ECR repository ARN"\n'
-            '  value       = aws_ecr_repository.app.arn\n}\n'
+            f'module "ecr" {{\n'
+            f'  source = "./modules/ecr"\n\n'
+            f'  ecr_repositories = var.ecr_repositories\n'
+            f'  tags             = local.common_tags\n'
+            f'}}\n'
         ),
         "eventbridge": (
-            'output "rule_name" {\n  description = "EventBridge rule name"\n'
-            '  value       = local.eventbridge_rule_name\n}\n'
+            f'module "eventbridge" {{\n'
+            f'  source = "./modules/eventbridge"\n\n'
+            f'  eventbridge_schedules = local.eventbridge_schedules\n'
+            f'  lambda_arns           = local.lambda_arns\n'
+            f'  lambda_function_names = local.lambda_function_names\n'
+            f'  scheduler_role_arn    = try(aws_iam_role.lambda_exec.arn, null)\n'
+            f'  ecr_push_rule         = var.ecr_push_rule\n'
+            f'  tags                  = local.common_tags\n'
+            f'}}\n'
         ),
         "secrets-manager": (
-            'output "secret_arn" {\n  description = "Secrets Manager secret ARN — pass to Lambda as env var"\n'
-            '  value       = aws_secretsmanager_secret.app.arn\n}\n\n'
-            'output "secret_name" {\n  description = "Secrets Manager secret name"\n'
-            '  value       = aws_secretsmanager_secret.app.name\n}\n'
+            f'module "secrets_manager" {{\n'
+            f'  source = "./modules/secrets_manager"\n\n'
+            f'  secrets     = var.secrets\n'
+            f'  kms_key_arn = try(module.kms.key_arn, null)\n'
+            f'  tags        = local.common_tags\n'
+            f'}}\n'
         ),
         "cloudwatch": (
-            'output "log_group_name" {\n  description = "Application CloudWatch log group name"\n'
-            '  value       = aws_cloudwatch_log_group.app.name\n}\n\n'
-            'output "dashboard_name" {\n  description = "CloudWatch dashboard name"\n'
-            '  value       = aws_cloudwatch_dashboard.main.dashboard_name\n}\n'
+            f'module "cloudwatch" {{\n'
+            f'  source = "./modules/cloudwatch"\n\n'
+            f'  log_retention_days = var.log_retention_days\n'
+            f'  sns_topic_arn      = try(module.sns.topic_arn, null)\n'
+            f'  lambda_log_groups  = local.lambda_log_groups\n'
+            f'  cloudwatch_alarms  = var.cloudwatch_alarms\n'
+            f'  dashboard          = var.dashboard\n'
+            f'  tags               = local.common_tags\n'
+            f'}}\n'
         ),
     }
-    return _OUTPUTS.get(svc, f'# Add outputs that root main.tf needs from the {svc} module.\n')
-
-
-def _service_module_call(svc: str) -> str:
-    """Generate the root main.tf module call block for a non-compute service module."""
-    mod_name = svc.replace("-", "_")
-    lines = [
-        f'module "{mod_name}" {{',
-        f'  source = "./modules/{mod_name}"',
-        '',
-        f'  project_name = var.project_name',
-        f'  environment  = var.environment',
-        f'  cost_centre  = var.cost_centre',
-        f'  tags         = local.common_tags',
-    ]
-    for vname, _, rhs, _ in _SERVICE_MODULE_VARS.get(svc, []):
-        lines.append(f'  {vname:<30} = {rhs}')
-    lines.append('}')
-    return '\n'.join(lines) + '\n'
+    return _CALLS.get(svc, (
+        f'module "{mod_name}" {{\n'
+        f'  source = "./modules/{mod_name}"\n\n'
+        f'  tags = local.common_tags\n'
+        f'}}\n'
+    ))
 
 
 def _write_modules_scaffold(base: Path, services: list[str]) -> None:
@@ -1175,19 +1711,29 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
 # variables.tf writer " declarations only, never hardcoded defaults
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-def _write_variables_tf(base: Path, service_vars: list[dict]) -> None:
+def _write_variables_tf(base: Path, service_vars: list[dict], services: list[str]) -> None:
     lines = [
         "# ------------------------------------------------------------------------------",
         "# Variable declarations -- generated by devops-scaffold-tool",
         "# Values are set per-environment in env/{env}/terraform.tfvars",
+        "# map(object) vars: add resources by editing tfvars only -- no code changes.",
         "# ------------------------------------------------------------------------------",
         "",
     ]
 
-    # Deduplicate by name (first occurrence wins)
+    # Base scalar vars first
     seen: set[str] = set()
-    all_vars = BASE_VARS + service_vars
-    for var in all_vars:
+    for var in BASE_VARS:
+        name = var["name"]
+        seen.add(name)
+        lines.append(f'variable "{name}" {{')
+        lines.append(f'  description = "{var["description"]}"')
+        lines.append(f'  type        = {var["type"]}')
+        lines.append("}")
+        lines.append("")
+
+    # Scalar service vars (eks, lambda sizing)
+    for var in service_vars:
         name = var["name"]
         if name in seen:
             continue
@@ -1198,8 +1744,240 @@ def _write_variables_tf(base: Path, service_vars: list[dict]) -> None:
         lines.append("}")
         lines.append("")
 
+    # map(object) service variables — matching terraform_templates pattern
+    _MAP_VARS: dict[str, str] = {
+        "sqs": '''\
+variable "sqs_queues" {
+  description = "Map of SQS queues. Add a queue by adding one block here — no code change needed."
+  type = map(object({
+    name                       = string
+    message_retention_seconds  = number
+    max_message_size           = optional(number, 1048576)
+    visibility_timeout_seconds = number
+    dlq_key                    = string
+  }))
+  default = {}
+}
+
+variable "dlq_queues" {
+  description = "Map of Dead Letter Queues paired with sqs_queues entries."
+  type = map(object({
+    name                      = string
+    message_retention_seconds = number
+  }))
+  default = {}
+}
+''',
+        "sns": '''\
+variable "sns" {
+  description = "SNS topic configuration with optional subscriptions."
+  type = object({
+    name = string
+    subscriptions = optional(map(object({
+      protocol = string
+      endpoint = string
+    })), {})
+  })
+  default = null
+}
+''',
+        "kms": '''\
+variable "kms_deletion_window_days" {
+  description = "KMS key deletion window in days (7-30)."
+  type        = number
+  default     = 7
+}
+''',
+        "ecr": '''\
+variable "ecr_repositories" {
+  description = "Map of ECR repositories. Add a repo by adding one block here."
+  type = map(object({
+    name                 = string
+    image_tag_mutability = optional(string, "IMMUTABLE")
+    scan_on_push         = optional(bool, true)
+  }))
+  default = {}
+}
+''',
+        "eventbridge": '''\
+variable "eventbridge_schedules" {
+  description = "Map of EventBridge Scheduler schedules. lambda_key must match lambda_configs key."
+  type = map(object({
+    name                = string
+    description         = optional(string)
+    schedule_expression = string
+    timezone            = string
+    lambda_key          = string
+    retry_attempts      = optional(number, 0)
+  }))
+  default = {}
+}
+
+variable "ecr_push_rule" {
+  description = "If set, creates an EventBridge rule triggered on ECR image push."
+  type = object({
+    name        = string
+    repo_prefix = string
+  })
+  default = null
+}
+''',
+        "secrets-manager": '''\
+variable "secrets" {
+  description = "Map of Secrets Manager secrets. Add a secret by adding one block here."
+  type = map(object({
+    name                    = string
+    description             = optional(string)
+    recovery_window_in_days = optional(number, 7)
+  }))
+  default = {}
+}
+''',
+        "cloudwatch": '''\
+variable "cloudwatch_alarms" {
+  description = "CloudWatch alarm definitions per resource type."
+  type = object({
+    lambdas = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+    sqs     = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+    dlq     = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
+  })
+  default = { lambdas = {}, sqs = {}, dlq = {} }
+}
+
+variable "dashboard" {
+  description = "CloudWatch dashboard config."
+  type = object({
+    name = string
+    body = any
+  })
+  default = null
+}
+''',
+    }
+
+    for svc in services:
+        if svc in _MAP_VARS and svc not in seen:
+            seen.add(svc)
+            lines.append(_MAP_VARS[svc])
+
+    # lambda_configs always added when lambda is present
+    if "lambda" in services and "lambda_configs" not in seen:
+        seen.add("lambda_configs")
+        lines.append('''\
+variable "lambda_configs" {
+  description = "Map of Lambda functions. Add a function by adding one block here."
+  type = map(object({
+    function_name         = string
+    handler               = string
+    runtime               = optional(string, "python3.12")
+    timeout               = optional(number, 30)
+    memory_size           = optional(number, 512)
+    s3_bucket             = optional(string)
+    s3_key                = optional(string)
+    environment_variables = optional(map(string), {})
+    layers                = optional(list(string), [])
+    sqs_trigger = optional(object({
+      queue      = string
+      batch_size = number
+    }))
+  }))
+  default = {}
+}
+''')
+
     (base / "variables.tf").write_text("\n".join(lines), encoding="utf-8")
     typer.secho("  + variables.tf  [declarations only -- no defaults]", fg=typer.colors.GREEN)
+
+
+def _write_locals_tf(
+    base: Path,
+    project_name: str,
+    services: list[str],
+    connections: list[str],
+) -> None:
+    """
+    Generate locals.tf — transforms raw tfvars into resolved values for module calls.
+    Mirrors the locals.tf pattern in terraform_templates: resolves lambda_key -> ARN,
+    builds log group names, etc.
+    """
+    blocks: list[str] = [
+        "# locals.tf — generated by devops-scaffold-tool",
+        "# Transforms raw tfvars into resolved values passed to modules.",
+        "# Cross-module ARN references are resolved here, not in module code.",
+        "",
+    ]
+
+    if "lambda" in services:
+        blocks.append('''\
+locals {
+  # Apply defaults to each lambda config entry
+  lambda_configs = {
+    for key, cfg in var.lambda_configs :
+    key => merge({
+      runtime     = "python3.12"
+      timeout     = 30
+      memory_size = 512
+      layers      = []
+      environment_variables = {}
+    }, cfg)
+  }
+
+  # Convenience maps used by eventbridge and cloudwatch modules
+  lambda_arns = {
+    for key, fn in module.lambda : key => fn.function_arn
+  }
+
+  lambda_function_names = {
+    for key, fn in module.lambda : key => fn.function_name
+  }
+
+  # CloudWatch log group per Lambda function
+  lambda_log_groups = {
+    for key, cfg in local.lambda_configs :
+    key => {
+      name              = "/aws/lambda/${cfg.function_name}"
+      retention_in_days = var.log_retention_days
+    }
+  }
+}
+''')
+
+    if "eventbridge" in services:
+        blocks.append('''\
+locals {
+  # Resolve lambda_key -> ARN for EventBridge schedules
+  eventbridge_schedules = {
+    for key, sched in var.eventbridge_schedules :
+    key => sched
+    # lambda_arn is resolved inside the eventbridge module using lambda_arns map
+  }
+}
+''')
+
+    if "sqs" in services and "cloudwatch" in services:
+        blocks.append('''\
+locals {
+  # CloudWatch alarms for SQS queues — auto-built from sqs_queues map
+  sqs_alarm_targets = {
+    for k, q in var.sqs_queues : k => {
+      name      = q.name
+      threshold = 100
+      enabled   = true
+    }
+  }
+
+  dlq_alarm_targets = {
+    for k, q in var.dlq_queues : k => {
+      name      = q.name
+      threshold = 1
+      enabled   = true
+    }
+  }
+}
+''')
+
+    (base / "locals.tf").write_text("\n".join(blocks), encoding="utf-8")
+    typer.secho("  + locals.tf  [cross-module ARN resolution]", fg=typer.colors.GREEN)
 
 
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -1213,9 +1991,9 @@ def _write_env_files(
     owner: str,
     environments: dict,
     service_vars: list[dict],
+    services: list[str],
 ) -> None:
-    env_names   = list(environments.keys()) if environments else ["dev", "staging", "prod"]
-    all_svc_vars = service_vars  # already deduplicated in variables.tf logic
+    env_names = list(environments.keys()) if environments else ["dev", "staging", "prod"]
 
     for env_name in env_names:
         env_dir = base / "env" / env_name
@@ -1236,10 +2014,168 @@ def _write_env_files(
             encoding="utf-8",
         )
 
-        # "" terraform.tfvars """""""""""""""""""""""""""""""""""""""""""""
+        env_cfg = environments.get(env_name, {})
+
+        # Resolve scalar per-env values (eks sizing, lambda sizing)
+        scalar_lines: list[str] = []
+        seen_names: set[str] = set()
+        for var in service_vars:
+            name = var["name"]
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
+            scalar_lines.append(_format_tfvar(name, val))
+
+        # Resolve per-env aliases (uat->staging, live->prod) for object defaults
+        _env_alias = env_name
+        if env_name in ("uat", "qa", "test"):
+            _env_alias = "staging"
+        elif env_name in ("live", "production"):
+            _env_alias = "prod"
+        _is_prod = _env_alias == "prod"
+
+        # Build map(object) blocks
+        obj_blocks: list[str] = []
+
+        if "lambda" in services:
+            lambda_cfg = env_cfg.get("lambda", {})
+            mem   = lambda_cfg.get("memory_mb", 512 if not _is_prod else 1024)
+            timo  = lambda_cfg.get("timeout_s", 30)
+            obj_blocks.append(f'''\
+# Lambda function configurations
+# Add a new function by adding one block inside lambda_configs.
+lambda_configs = {{
+  deploy = {{
+    function_name         = "{project_name}-{env_name}-func"
+    handler               = "lambda_function.lambda_handler"
+    runtime               = "python3.12"
+    timeout               = {timo}
+    memory_size           = {mem}
+    s3_bucket             = "REPLACE_WITH_DEPLOY_BUCKET"
+    s3_key                = "lambda/app.zip"
+    environment_variables = {{
+      ENV          = "{env_name.upper()}"
+      PROJECT_NAME = "{project_name}"
+    }}
+  }}
+}}
+''')
+
+        if "sqs" in services:
+            vis = 60
+            ret = 345600 if _is_prod else 86400
+            obj_blocks.append(f'''\
+# SQS queue configurations
+# Add a new queue by adding one block inside sqs_queues (and matching DLQ in dlq_queues).
+sqs_queues = {{
+  main_queue = {{
+    name                       = "{project_name}-{env_name}-queue"
+    message_retention_seconds  = {ret}
+    max_message_size           = 1048576
+    visibility_timeout_seconds = {vis}
+    dlq_key                    = "main_dlq"
+  }}
+}}
+
+dlq_queues = {{
+  main_dlq = {{
+    name                      = "{project_name}-{env_name}-dlq"
+    message_retention_seconds = {1209600 if _is_prod else 345600}
+  }}
+}}
+''')
+
+        if "ecr" in services:
+            mut = "IMMUTABLE" if _is_prod else "MUTABLE"
+            obj_blocks.append(f'''\
+# ECR repository configurations
+ecr_repositories = {{
+  app = {{
+    name                 = "{project_name}-{env_name}-app"
+    image_tag_mutability = "{mut}"
+    scan_on_push         = {str(_is_prod).lower()}
+  }}
+}}
+''')
+
+        if "secrets-manager" in services:
+            rw = 30 if _is_prod else 0
+            obj_blocks.append(f'''\
+# Secrets Manager configurations
+# Add a new secret by adding one block inside secrets.
+secrets = {{
+  app_secrets = {{
+    name                    = "{project_name}/{env_name}/app"
+    description             = "Application secrets for {project_name} ({env_name})"
+    recovery_window_in_days = {rw}
+  }}
+}}
+''')
+
+        if "eventbridge" in services:
+            obj_blocks.append(f'''\
+# EventBridge Scheduler configurations
+# lambda_key must match a key in lambda_configs above.
+eventbridge_schedules = {{
+  daily_trigger = {{
+    name                = "{project_name}-scheduler-{env_name}"
+    description         = "Daily trigger for {project_name} deploy worker"
+    schedule_expression = "cron(0 0 * * ? *)"
+    timezone            = "UTC"
+    lambda_key          = "deploy"
+    retry_attempts      = 0
+  }}
+}}
+
+ecr_push_rule = {{
+  name        = "{project_name}-{env_name}-ecr-push"
+  repo_prefix = "{project_name}-{env_name}"
+}}
+''')
+
+        if "sns" in services:
+            obj_blocks.append(f'''\
+# SNS topic configuration
+sns = {{
+  name = "{project_name}-{env_name}-notifications"
+  subscriptions = {{
+    # email = {{
+    #   protocol = "email"
+    #   endpoint = "team@example.com"
+    # }}
+  }}
+}}
+''')
+
+        if "cloudwatch" in services:
+            fn_name = f"{project_name}-{env_name}-func"
+            q_name  = f"{project_name}-{env_name}-queue"
+            d_name  = f"{project_name}-{env_name}-dlq"
+            obj_blocks.append(f'''\
+# CloudWatch alarms
+cloudwatch_alarms = {{
+  lambdas = {{
+    deploy = {{ name = "{fn_name}", threshold = 1, enabled = true }}
+  }}
+  sqs = {{
+    main_queue = {{ name = "{q_name}", threshold = 100, enabled = true }}
+  }}
+  dlq = {{
+    main_dlq = {{ name = "{d_name}", threshold = 1, enabled = true }}
+  }}
+}}
+
+dashboard = {{
+  name = "{project_name}-{env_name}-dashboard"
+  body = {{}}
+}}
+''')
+
+        # Assemble tfvars
         tfvars_lines = [
-            f'# {env_name} environment " generated by devops-scaffold-tool',
-            f'# Do NOT commit secrets. Use AWS Secrets Manager or SSM Parameter Store.',
+            f'# {env_name} environment — generated by devops-scaffold-tool',
+            f'# Do NOT commit secrets here. Use the secrets map → AWS Secrets Manager.',
             "",
             f'project_name = "{project_name}"',
             f'region       = "{region}"',
@@ -1249,47 +2185,33 @@ def _write_env_files(
             f'cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
 
-        if all_svc_vars:
-            tfvars_lines.append("")
-            tfvars_lines.append(f"# --- Service-specific variables ---")
-            seen_names: set[str] = set()
-            env_cfg = environments.get(env_name, {})
-            for var in all_svc_vars:
-                name = var["name"]
-                if name in seen_names:
-                    continue
-                seen_names.add(name)
-                # infra.yaml environment overrides take priority over static defaults
-                val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
-                tfvars_lines.append(_format_tfvar(name, val))
+        if scalar_lines:
+            tfvars_lines += ["", "# ── Scalar sizing variables ──────────────────────────────────"] + scalar_lines
+
+        if obj_blocks:
+            tfvars_lines += ["", "# ── Service configurations (map objects) ─────────────────────"]
+            for blk in obj_blocks:
+                tfvars_lines.append(blk)
 
         (env_dir / "terraform.tfvars").write_text("\n".join(tfvars_lines) + "\n", encoding="utf-8")
 
-        # "" terraform.tfvars.example """""""""""""""""""""""""""""""""""""
+        # terraform.tfvars.example (commented-out copy)
         example_lines = [
-            f'# {env_name}.tfvars.example " copy to terraform.tfvars and fill in values',
-            f'# This file IS committed to source control (no secrets here).',
+            f'# {env_name}.tfvars.example — copy to terraform.tfvars and fill in real values.',
+            f'# This file IS committed to source control (no secrets).',
             "",
-            '# project_name = "REPLACE_WITH_PROJECT_NAME"',
-            '# region       = "REPLACE_WITH_REGION"',
+            f'# project_name = "{project_name}"',
+            f'# region       = "{region}"',
             f'# environment  = "{env_name}"',
-            '# owner        = "REPLACE_WITH_OWNER"',
-            '# vpc_cidr     = "10.0.0.0/16"',
-            '# cost_centre  = "REPLACE_WITH_COST_CENTRE"',
+            f'# owner        = "REPLACE_WITH_OWNER"',
+            f'# vpc_cidr     = "10.0.0.0/16"',
+            f'# cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
-
-        if all_svc_vars:
-            example_lines.append("")
-            example_lines.append("# --- Service-specific variables ---")
-            seen_names = set()
-            env_cfg = environments.get(env_name, {})
-            for var in all_svc_vars:
-                name = var["name"]
-                if name in seen_names:
-                    continue
-                seen_names.add(name)
-                val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
-                example_lines.append(f"# {_format_tfvar(name, val)}  # {var['description']}")
+        for line in scalar_lines:
+            example_lines.append(f'# {line}')
+        for blk in obj_blocks:
+            for ln in blk.splitlines():
+                example_lines.append(f'# {ln}')
 
         (env_dir / "terraform.tfvars.example").write_text("\n".join(example_lines) + "\n", encoding="utf-8")
 
