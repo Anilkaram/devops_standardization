@@ -1,16 +1,10 @@
 project:
-  name: daax-applicaiton 
-  region: us-west-2
-  owner: devops-team
-  type: container-platform
+  name: protecto-platform
+  region: us-east-1
+  owner: platform-team
+  type: web-api-container-platform
 
 stage: production
-
-NAMING CONVENTIONS: 
-All generated AWS resource names follow this pattern:
-
-  <project_name>-<environment>-<service_name>
-  daax-applicaiton-uat-ecr
 
 team:
   size: medium
@@ -23,64 +17,80 @@ runtime:
 # ── Services ─────────────────────────────────────────────────────────────────
 # Direct mapping of all infrastructure components from the architecture diagram.
 services:
-  # Container Registry
-  - ecr                   # Stores container images; triggers deployment on push
+  # Edge & Content Delivery
+  - cloudfront            # CDN distributing static assets from S3 to end users via AWS WAF
+  - s3                    # Static file hosting (HTML, CSS, JS) behind CloudFront
 
-  # Event Orchestration & Queueing
-  - eventbridge           # Detects ECR pushes and routes events
-  - sqs                   # Buffers deployment events and handles retry state
+  # Security
+  - waf                   # AWS WAF inspects all incoming traffic from client devices
 
-  # Compute & Deployment Automation
-  - lambda                # Execution worker that applies manifests to the EKS cluster
+  # API Entry Point
+  - api-gateway           # Receives API calls from WAF; routes to Lambda for processing
 
-  # Core Container Platform
-  - eks                   # Managed Kubernetes cluster hosting the workloads
+  # Compute (Lambda in public subnet, EKS in private subnet)
+  - lambda                # Processes API requests; orchestrates EKS workload operations
+  - eks                   # Managed Kubernetes cluster hosting containerised application pods
+
+  # Container Registry (private subnet)
+  - ecr                   # Stores container images; EKS pulls images on deployment
 
   # Security & Key Management
-  - kms                   # Encrypts repository images, state, and secrets
-  - secrets-manager       # Securely stores EKS cluster tokens and kubeconfig secrets
+  - kms                   # Encrypts S3 objects, EKS secrets, and ECR images at rest
+  - secrets-manager       # Stores EKS credentials and service account tokens securely
 
-  # Monitoring & Alerting
-  - sns                   # Dispatches pipeline status alerts to subscribers
-  - cloudwatch            # Aggregates logs and metrics from Lambda and EKS containers
+  # Monitoring & Observability
+  - cloudwatch            # Collects logs and metrics from Lambda, EKS nodes, and API Gateway
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 auth:
   required: true
-  method: iam             # IAM Roles for Lambda execution and EKS authentication
+  method: iam             # IAM roles for Lambda execution, ECR pull, and EKS node permissions
 
 # ── Connections ──────────────────────────────────────────────────────────────
-# Directional relationship matrix defining network and identity boundaries.
 connections:
-  # Pipeline Trigger Chain
-  - { from: ecr,             to: eventbridge } # Image push emits state change event
-  - { from: eventbridge,     to: lambda      } # Routes matching rules to deployment worker
-  - { from: eventbridge,     to: sqs         } # Logs events in queue for audit trails
+  # Edge Traffic Flow
+  - { from: cloudfront,     to: s3            }  # CloudFront fetches static files from S3 origin
+  - { from: api-gateway,    to: lambda        }  # API Gateway invokes Lambda for all API calls
 
-  # Deployment Execution Chain
-  - { from: secrets-manager, to: lambda      } # Lambda pulls credentials to access EKS
-  - { from: lambda,          to: eks         } # Applies rolling update manifests to K8s API
-  - { from: kms,             to: secrets-manager } # KMS manages wrapper keys for secrets
+  # Compute → Container Platform
+  - { from: lambda,         to: eks           }  # Lambda triggers workload operations on EKS
+  - { from: ecr,            to: eks           }  # EKS pulls container images from ECR on deploy
 
-  # Observability & Alerting Chain
-  - { from: lambda,          to: sns         } # Notifies success/failure alerts
-  - { from: lambda,          to: cloudwatch  } # Appends function logs and runtime durations
-  - { from: eks,             to: cloudwatch  } # Container Insights captures node/pod metrics
+  # Security Integration
+  - { from: kms,            to: s3            }  # KMS-SSE encrypts all S3 static file objects
+  - { from: kms,            to: eks           }  # KMS encrypts Kubernetes secrets at rest
+  - { from: secrets-manager, to: lambda       }  # Lambda fetches EKS credentials from Secrets Manager
+
+  # Observability
+  - { from: lambda,         to: cloudwatch    }  # Lambda execution logs and error metrics
+  - { from: eks,            to: cloudwatch    }  # EKS Container Insights — node and pod metrics
+  - { from: api-gateway,    to: cloudwatch    }  # API Gateway access logs and latency metrics
 
 # ── Flows ────────────────────────────────────────────────────────────────────
-# Logical end-to-end user and system journeys across the infrastructure.
 flows:
-  deployment_flow:
-    description: "Automated continuous delivery journey: A new container image is pushed to ECR, triggering an EventBridge rule. This invokes a Python-based Lambda function which securely fetches cluster credentials from AWS Secrets Manager, authenticates via IAM, and executes a rolling update to the EKS worker nodes."
-    services: [ecr, eventbridge, secrets-manager, lambda, eks]
+  user_request_flow:
+    description: "End-user access journey: Client devices hit AWS WAF which inspects and filters traffic. Static asset requests are served via CloudFront from an S3 bucket. Dynamic API calls pass through API Gateway, invoke Lambda in the public subnet, which in turn communicates with the EKS cluster in the private subnet to process and return results."
+    services: [cloudfront, s3, api-gateway, lambda, eks]
 
-  notification_flow:
-    description: "Pipeline observability journey: Lifecycle events and runtime failures are intercepted during deployment execution. Lambda forwards status updates to SNS to alert developers, while both Lambda execution logs and EKS Container Insights metrics are unified inside CloudWatch."
-    services: [lambda, eks, sns, cloudwatch]
+  container_deployment_flow:
+    description: "Container image delivery: New images are pushed to ECR. The EKS cluster pulls updated images directly from ECR within the private subnet via the Image Pull path. IAM roles control pull permissions and KMS encrypts image layers at rest."
+    services: [ecr, eks, kms]
+
+  observability_flow:
+    description: "Platform monitoring: Lambda, EKS nodes/pods, and API Gateway all emit logs and metrics to CloudWatch. Alarms can be configured on Lambda error rates, EKS CPU/memory, and API Gateway 5xx counts."
+    services: [lambda, eks, api-gateway, cloudwatch]
 
 # ── Environments ─────────────────────────────────────────────────────────────
-# Infrastructure topologies and compute footprint allocations per environment.
 environments:
+  dev:
+    multi_az: false
+    eks:
+      node_count: 1
+      instance_type: t3.large
+    lambda:
+      memory_mb: 256
+      timeout_s: 30
+
   uat:
     multi_az: true
     eks:
@@ -88,16 +98,16 @@ environments:
       instance_type: t3.xlarge
     lambda:
       memory_mb: 512
-      timeout_s: 60
+      timeout_s: 30
 
   prod:
     multi_az: true
     eks:
       node_count: 3
-      instance_type: t3.xlarge
+      instance_type: t3.2xlarge
     lambda:
       memory_mb: 1024
-      timeout_s: 60
+      timeout_s: 30
 
 # ── CI/CD ────────────────────────────────────────────────────────────────────
 cicd:

@@ -444,6 +444,9 @@ on:
     branches: [{main_branch}, develop, "release/**"]
   pull_request:
     branches: [{main_branch}]
+  schedule:
+    # Drift detection: runs terraform plan weekly to catch manual console changes
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       environment:
@@ -455,7 +458,7 @@ on:
         description: Action to perform
         required: true
         type: choice
-        options: [deploy, rollback]
+        options: [deploy, rollback, drift-check]
         default: deploy
 
 concurrency:
@@ -660,6 +663,61 @@ jobs:
       - name: Notify rollback complete
         run: |
           echo "Rollback of ${{{{ env.PROJECT_NAME }}}} in ${{{{ github.event.inputs.environment }}}} complete."
+
+  # ── Drift Detection (weekly schedule + manual) ─────────────────────────────
+  drift-check:
+    name: Drift Detection (${{{{ matrix.environment }}}})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.inputs.action == 'drift-check'
+    strategy:
+      matrix:
+        environment: [{', '.join(env_names)}]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{{{ env.TF_VERSION }}}}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{{{ secrets.AWS_DEPLOY_ROLE_ARN }}}}
+          aws-region: ${{{{ env.AWS_REGION }}}}
+
+      - name: Terraform init
+        run: terraform -chdir=.infra init -backend-config=env/${{{{ matrix.environment }}}}/backend.tf
+
+      - name: Terraform plan (drift check)
+        id: plan
+        run: |
+          terraform -chdir=.infra plan \\
+            -var-file=env/${{{{ matrix.environment }}}}/terraform.tfvars \\
+            -detailed-exitcode \\
+            -out=drift-${{{{ matrix.environment }}}}.tfplan 2>&1 | tee plan_output.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Flag drift detected
+        if: steps.plan.outputs.exit_code == '2'
+        run: |
+          echo "::warning::DRIFT DETECTED in ${{{{ matrix.environment }}}} — manual changes found. Review the plan above."
+          echo "DRIFT_ENV=${{{{ matrix.environment }}}}" >> "$GITHUB_ENV"
+
+      - name: Open GitHub Issue on drift
+        if: steps.plan.outputs.exit_code == '2' && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({{
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Drift Detected] ${{{{ env.DRIFT_ENV }}}} — ${{{{ new Date().toISOString().split('T')[0] }}}}`,
+              body: `## Terraform Drift Detected\\n\\nEnvironment: **${{{{ env.DRIFT_ENV }}}}**\\n\\nManual changes were found outside of Terraform.\\nPlease review the [workflow run](${{{{ github.server_url }}}}/${{{{ github.repository }}}}/actions/runs/${{{{ github.run_id }}}}) and reconcile.\\n\\n> Auto-opened by drift-check scheduled job.`,
+              labels: ['infrastructure', 'drift']
+            }})
 """
 
     # Write output

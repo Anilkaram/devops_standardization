@@ -25,3 +25,9 @@ google-generativeai>=0.8.0
 # AI_PROVIDER=kimi  AI_MODEL=kimi-k2.7-code
 # Uses OpenAI-compatible API (openai package above covers this — no extra install needed)
 # Base URL: https://api.moonshot.cn/v1
+
+# ── Quality scanning ─────────────────────────────────────────────────────────
+
+# Checkov — IaC security + compliance scanner (auto-runs after scaffold init)
+# Shows quality score: passed/failed checks + percentage
+checkov>=3.0.0

@@ -493,6 +493,8 @@ services:
       - logs:CreateLogGroup
       - logs:CreateLogStream
       - logs:PutLogEvents
+    # cloudwatch metrics actions cannot be scoped to a resource ARN (AWS limitation)
+    wildcard_iam_actions:
       - cloudwatch:PutMetricData
       - cloudwatch:GetMetricData
 
@@ -603,3 +605,4 @@ iam_resource_arns:
   textract:        ["*"]
   ses:             ["*"]
   xray:            ["*"]
+  cloudwatch:      ["arn:aws:logs:{region}:*:log-group:/aws/{project}-*", "arn:aws:logs:{region}:*:log-group:/aws/{project}-*:*", "arn:aws:cloudwatch:{region}:*:alarm:{project}-*"]

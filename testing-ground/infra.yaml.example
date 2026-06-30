@@ -9,27 +9,27 @@
 #   {project.name}-{environment}-{resource-suffix}
 #
 # Separator rules:
-#   Hyphen   -   resource names       e.g. daax-applicaiton-dev-func
-#   Slash    /   path-based names     e.g. daax-applicaiton/dev/app  (Secrets Manager, log groups)
+#   Hyphen   -   resource names       e.g. protecto-platform-dev-func
+#   Slash    /   path-based names     e.g. protecto-platform/dev/app  (Secrets Manager, log groups)
 #   Snake    _   Terraform variables  e.g. lambda_timeout, eks_node_count
 #
-# Resource name examples (using project.name = "daax-applicaiton"):
+# Resource name examples (using project.name = "protecto-platform"):
 #
-#   Lambda function          daax-applicaiton-dev-func
-#   Lambda IAM role          daax-applicaiton-dev-lambda-role
-#   EKS cluster              daax-applicaiton-dev-eks
-#   EKS cluster IAM role     daax-applicaiton-dev-eks-cluster-role
-#   EKS node group           daax-applicaiton-dev-ng
-#   ECR repository           daax-applicaiton-dev-app
-#   SQS queue                daax-applicaiton-dev-queue
-#   SQS dead-letter queue    daax-applicaiton-dev-dlq
-#   SNS topic                daax-applicaiton-dev-notifications
-#   KMS key alias            alias/daax-applicaiton-dev
-#   Secrets Manager (app)    daax-applicaiton/dev/app
-#   Secrets Manager (eks)    daax-applicaiton/dev/eks-auth
-#   CloudWatch log group     /aws/lambda/daax-applicaiton-dev-func
-#   CloudWatch dashboard     daax-applicaiton-dev
-#   CloudWatch alarm         daax-applicaiton-dev-lambda-errors
+#   Lambda function          protecto-platform-dev-func
+#   Lambda IAM role          protecto-platform-dev-lambda-role
+#   EKS cluster              protecto-platform-dev-eks
+#   EKS cluster IAM role     protecto-platform-dev-eks-cluster-role
+#   EKS node group           protecto-platform-dev-ng
+#   ECR repository           protecto-platform-dev-app
+#   SQS queue                protecto-platform-dev-queue
+#   SQS dead-letter queue    protecto-platform-dev-dlq
+#   SNS topic                protecto-platform-dev-notifications
+#   KMS key alias            alias/protecto-platform-dev
+#   Secrets Manager (app)    protecto-platform/dev/app
+#   Secrets Manager (eks)    protecto-platform/dev/eks-auth
+#   CloudWatch log group     /aws/lambda/protecto-platform-dev-func
+#   CloudWatch dashboard     protecto-platform-dev
+#   CloudWatch alarm         protecto-platform-dev-lambda-errors
 #
 # FIELD RULES
 # ───────────
