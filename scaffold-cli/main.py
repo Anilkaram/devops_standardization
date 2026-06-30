@@ -506,11 +506,21 @@ cicd:
     # ── Post-generation: Checkov quality score ────────────────────────────────
     _run_checkov_score(INFRA_DIR)
 
-    typer.secho("\n> Done.", fg=typer.colors.GREEN, bold=True)
-    typer.echo(f"  Scaffold    : {INFRA_DIR.absolute()}")
-    typer.echo(f"  Decisions   : {decisions_path.absolute()}")
-    typer.echo(f"  Cost est.   : {(INFRA_DIR / 'cost-estimate.md').absolute()}")
-    typer.echo(f"  Example     : infra.yaml.example  (naming conventions + field reference)")
+    typer.secho("\n> Done. Generated files:", fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"  Scaffold       : {INFRA_DIR.absolute()}")
+    typer.echo(f"  Decisions      : {decisions_path.absolute()}")
+
+    cost_est_path = INFRA_DIR / "cost-estimate.md"
+    if cost_est_path.exists():
+        typer.secho(f"  Cost estimate  : {cost_est_path.absolute()}  <-- open this to see monthly costs", fg=typer.colors.CYAN)
+    else:
+        typer.secho("  Cost estimate  : [not generated — check for errors above]", fg=typer.colors.YELLOW)
+
+    checkov_report = INFRA_DIR / "checkov-report.txt"
+    if checkov_report.exists():
+        typer.secho(f"  Quality report : {checkov_report.absolute()}", fg=typer.colors.CYAN)
+
+    typer.echo(f"  Example        : infra.yaml.example  (naming conventions + field reference)")
     typer.secho(
         "\n  Next step: run 'python scaffold-cli/main.py init-backend' to create the S3 state bucket.",
         fg=typer.colors.CYAN,
@@ -527,26 +537,32 @@ def _run_checkov_score(infra_dir: Path) -> None:
 
     typer.secho("\n> Checkov quality scan...", fg=typer.colors.BLUE, bold=True)
 
-    # Resolve checkov: prefer PATH binary, fall back to python -m checkov
-    _checkov_cmd: list
+    # Resolve checkov command — three strategies in order:
+    #   1. checkov binary on PATH  (standard install: pip install checkov)
+    #   2. python -m checkov       (installed in same venv as this script)
+    #   3. not found               (show install hint and return)
+    _checkov_cmd: list = []
+
     if shutil.which("checkov"):
         _checkov_cmd = ["checkov"]
     else:
-        # Try running via current interpreter (works when installed in same venv)
+        # Verify the module is actually present before setting command
         try:
-            subprocess.run(
+            probe = subprocess.run(
                 [sys.executable, "-m", "checkov", "--version"],
-                capture_output=True, timeout=10,
+                capture_output=True,
+                timeout=15,
             )
-            _checkov_cmd = [sys.executable, "-m", "checkov"]
+            if probe.returncode == 0:
+                _checkov_cmd = [sys.executable, "-m", "checkov"]
         except Exception:
-            _checkov_cmd = []
+            pass  # executable or module not found — leave _checkov_cmd empty
 
     if not _checkov_cmd:
         typer.secho(
-            "  [!] Checkov not found — install it to see your scaffold quality score:\n"
+            "  [!] Checkov not installed — to see your scaffold quality score run:\n"
             "      pip install checkov\n"
-            "  Then re-run: python scaffold-cli/main.py init --yes",
+            "  Then re-generate: python scaffold-cli/main.py init --yes",
             fg=typer.colors.YELLOW,
         )
         return
@@ -565,11 +581,18 @@ def _run_checkov_score(infra_dir: Path) -> None:
             timeout=120,
         )
         output = result.stdout + result.stderr
+    except FileNotFoundError:
+        # Binary found by which() but not actually executable (broken PATH entry)
+        typer.secho(
+            "  [!] Checkov binary not executable — reinstall with: pip install --upgrade checkov",
+            fg=typer.colors.YELLOW,
+        )
+        return
     except subprocess.TimeoutExpired:
         typer.secho("  [!] Checkov timed out (>120s). Run manually: checkov -d .infra", fg=typer.colors.YELLOW)
         return
     except Exception as exc:
-        typer.secho(f"  [!] Checkov error: {exc}", fg=typer.colors.YELLOW)
+        typer.secho(f"  [!] Checkov scan failed: {exc}", fg=typer.colors.YELLOW)
         return
 
     # Parse: "Passed checks: 45, Failed checks: 8, Skipped checks: 2"
