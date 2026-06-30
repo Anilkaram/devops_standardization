@@ -500,10 +500,202 @@ cicd:
 
     _write_infra_example(Path("infra.yaml.example"), name)
 
+    # ── Post-generation: scan tfvars for plaintext secrets ────────────────────
+    _scan_tfvars_for_secrets(INFRA_DIR)
+
     typer.secho("\n> Done.", fg=typer.colors.GREEN, bold=True)
-    typer.echo(f"  Scaffold : {INFRA_DIR.absolute()}")
-    typer.echo(f"  Decisions: {decisions_path.absolute()}")
-    typer.echo(f"  Example  : infra.yaml.example  (naming conventions + field reference)")
+    typer.echo(f"  Scaffold    : {INFRA_DIR.absolute()}")
+    typer.echo(f"  Decisions   : {decisions_path.absolute()}")
+    typer.echo(f"  Cost est.   : {(INFRA_DIR / 'cost-estimate.md').absolute()}")
+    typer.echo(f"  Example     : infra.yaml.example  (naming conventions + field reference)")
+    typer.secho(
+        "\n  Next step: run 'python scaffold-cli/main.py init-backend' to create the S3 state bucket.",
+        fg=typer.colors.CYAN,
+    )
+
+
+def _scan_tfvars_for_secrets(infra_dir: Path) -> None:
+    """Warn if generated tfvars contain obvious plaintext secret patterns."""
+    import re as _re
+    _SECRET_PATTERNS = [
+        r'(?i)(password|passwd|secret|api_key|api-key|token|private_key)\s*=\s*"[^"]{6,}"',
+        r'(?i)(aws_access_key_id|aws_secret_access_key)\s*=\s*"[^"]{10,}"',
+    ]
+    _SAFE_PLACEHOLDERS = {"REPLACE_WITH", "your-", "example", "PLACEHOLDER", "TODO", "changeme"}
+
+    found = []
+    for tfvars in infra_dir.rglob("terraform.tfvars"):
+        content = tfvars.read_text(encoding="utf-8", errors="ignore")
+        for pattern in _SECRET_PATTERNS:
+            for match in _re.finditer(pattern, content):
+                value = match.group(0)
+                if not any(p.lower() in value.lower() for p in _SAFE_PLACEHOLDERS):
+                    found.append((tfvars.relative_to(infra_dir), value[:60]))
+
+    if found:
+        typer.secho("\n! SECRET SCAN WARNING", fg=typer.colors.RED, bold=True)
+        typer.secho(
+            "  The following tfvars lines look like plaintext secrets.\n"
+            "  Move these values to AWS Secrets Manager and reference via secrets map.\n"
+            "  NEVER commit real credentials to source control.\n",
+            fg=typer.colors.YELLOW,
+        )
+        for path, snippet in found:
+            typer.secho(f"  {path}: {snippet}...", fg=typer.colors.RED)
+    else:
+        typer.secho("  [OK] Secret scan: no plaintext secrets detected in tfvars.", fg=typer.colors.GREEN)
+
+
+@app.command("init-backend")
+def init_backend(
+    bucket: str = typer.Option(
+        None, "--bucket",
+        help="S3 bucket name for Terraform state. Default: <project>-tfstate-<region>",
+    ),
+    table: str = typer.Option(
+        None, "--table",
+        help="DynamoDB table name for state locking. Default: <project>-tf-locks",
+    ),
+    region: str = typer.Option(
+        None, "--region",
+        help="AWS region. Defaults to project.region from infra.yaml.",
+    ),
+    profile: str = typer.Option(
+        None, "--profile",
+        help="AWS CLI profile to use.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Print the bootstrap Terraform without applying.",
+    ),
+):
+    """Bootstrap S3 state bucket + DynamoDB lock table (run ONCE before terraform init).
+
+    Creates a dedicated Terraform file that provisions:
+      - S3 bucket with versioning, encryption, and block-public-access
+      - DynamoDB table for state locking
+
+    After running this, replace REPLACE_WITH_STATE_BUCKET and REPLACE_WITH_LOCK_TABLE
+    in env/*/backend.tf with the values printed here.
+    """
+    config = _load_yaml()
+    project = config.get("project", {})
+    proj_name  = project.get("name", "myproject")
+    proj_region = region or project.get("region", "us-east-1")
+
+    bucket_name = bucket or f"{proj_name}-tfstate-{proj_region}"
+    table_name  = table  or f"{proj_name}-tf-locks"
+
+    _profile_line = f'profile = "{profile}"' if profile else '# profile = "YOUR_AWS_PROFILE"  # uncomment if needed'
+    bootstrap_hcl = f'''\
+# == Terraform State Backend Bootstrap ========================================
+# Run ONCE to create S3 bucket + DynamoDB lock table before any other terraform command.
+# After apply, update env/*/backend.tf with:
+#   bucket         = "{bucket_name}"
+#   dynamodb_table = "{table_name}"
+# =============================================================================
+
+terraform {{
+  required_version = ">= 1.5.0"
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }}
+  }}
+}}
+
+provider "aws" {{
+  region  = "{proj_region}"
+  {_profile_line}
+}}
+
+# S3 bucket for Terraform state
+resource "aws_s3_bucket" "tf_state" {{
+  bucket = "{bucket_name}"
+
+  lifecycle {{
+    prevent_destroy = true
+  }}
+}}
+
+resource "aws_s3_bucket_versioning" "tf_state" {{
+  bucket = aws_s3_bucket.tf_state.id
+  versioning_configuration {{
+    status = "Enabled"
+  }}
+}}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "tf_state" {{
+  bucket = aws_s3_bucket.tf_state.id
+  rule {{
+    apply_server_side_encryption_by_default {{
+      sse_algorithm = "AES256"
+    }}
+  }}
+}}
+
+resource "aws_s3_bucket_public_access_block" "tf_state" {{
+  bucket                  = aws_s3_bucket.tf_state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}}
+
+# DynamoDB table for state locking
+resource "aws_dynamodb_table" "tf_locks" {{
+  name         = "{table_name}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {{
+    name = "LockID"
+    type = "S"
+  }}
+
+  lifecycle {{
+    prevent_destroy = true
+  }}
+}}
+
+output "state_bucket" {{
+  value = aws_s3_bucket.tf_state.bucket
+}}
+
+output "lock_table" {{
+  value = aws_dynamodb_table.tf_locks.name
+}}
+'''
+
+    typer.secho("\n> Bootstrap configuration:", fg=typer.colors.BLUE, bold=True)
+    typer.echo(f"  S3 bucket     : {bucket_name}")
+    typer.echo(f"  DynamoDB table: {table_name}")
+    typer.echo(f"  Region        : {proj_region}")
+
+    bootstrap_dir  = Path("bootstrap-backend")
+    bootstrap_file = bootstrap_dir / "main.tf"
+
+    if dry_run:
+        typer.secho("\n=== DRY RUN — HCL that would be written ===", fg=typer.colors.MAGENTA)
+        typer.echo(bootstrap_hcl)
+        typer.secho("=== END DRY RUN ===", fg=typer.colors.MAGENTA)
+        return
+
+    bootstrap_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap_file.write_text(bootstrap_hcl, encoding="utf-8")
+
+    typer.secho(f"\n  Written: {bootstrap_file.absolute()}", fg=typer.colors.GREEN)
+    typer.secho(
+        "\n> Apply steps:\n"
+        f"  1. cd {bootstrap_dir}\n"
+        f"  2. terraform init\n"
+        f"  3. terraform apply\n"
+        f"\n  After apply, update env/*/backend.tf:\n"
+        f'     bucket         = "{bucket_name}"\n'
+        f'     dynamodb_table = "{table_name}"\n',
+        fg=typer.colors.CYAN,
+    )
 
 
 @app.command()
