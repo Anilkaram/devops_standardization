@@ -537,32 +537,70 @@ def _run_checkov_score(infra_dir: Path) -> None:
 
     typer.secho("\n> Checkov quality scan...", fg=typer.colors.BLUE, bold=True)
 
-    # Resolve checkov command — three strategies in order:
-    #   1. checkov binary on PATH  (standard install: pip install checkov)
-    #   2. python -m checkov       (installed in same venv as this script)
-    #   3. not found               (show install hint and return)
+    # Resolve checkov command — four strategies tried in order:
+    #   1. python -m checkov      (current interpreter, works when venv is active)
+    #   2. venv/Scripts/checkov   (project venv beside scaffold-cli, Windows .cmd or Unix script)
+    #   3. PATH binary            (system-wide or CI runner install)
+    #   4. not found              (show install hint)
     _checkov_cmd: list = []
 
-    if shutil.which("checkov"):
-        _checkov_cmd = ["checkov"]
-    else:
-        # Verify the module is actually present before setting command
+    def _probe(cmd: list) -> bool:
+        """Return True if cmd runs successfully (returncode 0)."""
         try:
-            probe = subprocess.run(
-                [sys.executable, "-m", "checkov", "--version"],
-                capture_output=True,
-                timeout=15,
-            )
-            if probe.returncode == 0:
-                _checkov_cmd = [sys.executable, "-m", "checkov"]
+            r = subprocess.run(cmd + ["--version"], capture_output=True, timeout=15)
+            return r.returncode == 0
         except Exception:
-            pass  # executable or module not found — leave _checkov_cmd empty
+            return False
+
+    # Strategy 1: current interpreter's module (venv active or checkov in system python)
+    if _probe([sys.executable, "-m", "checkov"]):
+        _checkov_cmd = [sys.executable, "-m", "checkov"]
+
+    # Strategy 2: scan sibling venv dirs; invoke the checkov script via the venv's own Python.
+    # The .cmd wrapper fails when called from outside its venv (wrong sys.path).
+    # Instead we find venv/Scripts/python.exe and call: python <venv>/Scripts/checkov
+    if not _checkov_cmd:
+        _script_dir = Path(__file__).resolve().parent
+        _venv_roots = [
+            _script_dir.parent / "venv",
+            _script_dir.parent / ".venv",
+            _script_dir / "venv",
+            _script_dir / ".venv",
+            Path.cwd() / "venv",
+            Path.cwd() / ".venv",
+        ]
+        for _venv in _venv_roots:
+            # Locate the venv's Python interpreter
+            _venv_python = None
+            for _py in ("Scripts/python.exe", "Scripts/python", "bin/python", "bin/python3"):
+                _p = _venv / _py
+                if _p.exists():
+                    _venv_python = _p
+                    break
+            if not _venv_python:
+                continue
+            # Locate the checkov entry-point script (not .cmd — it has an absolute shebang)
+            _checkov_script = None
+            for _name in ("Scripts/checkov", "Scripts/checkov.exe", "bin/checkov"):
+                _s = _venv / _name
+                if _s.exists():
+                    _checkov_script = _s
+                    break
+            if _checkov_script and _probe([str(_venv_python), str(_checkov_script)]):
+                _checkov_cmd = [str(_venv_python), str(_checkov_script)]
+                break
+
+    # Strategy 3: binary somewhere on PATH
+    if not _checkov_cmd:
+        _binary = shutil.which("checkov")
+        if _binary and _probe([_binary]):
+            _checkov_cmd = [_binary]
 
     if not _checkov_cmd:
         typer.secho(
-            "  [!] Checkov not installed — to see your scaffold quality score run:\n"
+            "  [!] Checkov not found — install it inside your venv:\n"
             "      pip install checkov\n"
-            "  Then re-generate: python scaffold-cli/main.py init --yes",
+            "  Then re-run: python scaffold-cli/main.py init --yes",
             fg=typer.colors.YELLOW,
         )
         return
@@ -581,13 +619,6 @@ def _run_checkov_score(infra_dir: Path) -> None:
             timeout=120,
         )
         output = result.stdout + result.stderr
-    except FileNotFoundError:
-        # Binary found by which() but not actually executable (broken PATH entry)
-        typer.secho(
-            "  [!] Checkov binary not executable — reinstall with: pip install --upgrade checkov",
-            fg=typer.colors.YELLOW,
-        )
-        return
     except subprocess.TimeoutExpired:
         typer.secho("  [!] Checkov timed out (>120s). Run manually: checkov -d .infra", fg=typer.colors.YELLOW)
         return

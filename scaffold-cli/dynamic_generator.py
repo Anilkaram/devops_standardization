@@ -135,6 +135,7 @@ data "aws_availability_zones" "available" {{
 module "vpc" {{
   source  = "{source}"
   version = "{version}"
+  #checkov:skip=CKV_TF_1:Registry source with semver pin; git URL format not supported for Terraform Registry modules
 
   name = "${{local.name_prefix}}-vpc"
   cidr = var.vpc_cidr
@@ -195,6 +196,15 @@ SECURITY BEST PRACTICES (from Terraform Best Practices policy):
   - Never hardcode secrets — use aws_secretsmanager_secret_version or SSM data sources
   - Use least-privilege IAM — no wildcard "*" actions unless unavoidable
   - Enable access logs on ALBs and API Gateways
+  LAMBDA SPECIFIC (must include ALL of the following):
+  - dead_letter_config { target_arn = var.dlq_arn } — always set; var.dlq_arn default null
+  - vpc_config { subnet_ids = var.subnet_private_ids, security_group_ids = [var.security_group_id] }
+  - reserved_concurrent_executions = var.reserved_concurrency (default -1 in tfvars)
+  - kms_key_arn = var.kms_key_arn on environment{} block to encrypt env vars
+  EKS SPECIFIC (must include ALL of the following):
+  - vpc_config: public_access_cidrs = var.eks_public_access_cidrs (default ["10.0.0.0/8"])
+  - encryption_config { provider { key_arn = var.kms_key_arn } resources = ["secrets"] }
+  - Never use endpoint_public_access = true without restricting public_access_cidrs
 
 TAGGING — every resource must include:
   tags = local.common_tags
@@ -448,20 +458,27 @@ def generate_iam_policy_block(
     for svc in connected_services:
         entry   = services_section.get(svc, {})
         actions = entry.get("iam_actions", [])
-        if not actions:
-            continue
+        wildcard_actions = entry.get("wildcard_iam_actions", [])
 
-        raw_arns      = arn_templates.get(svc, ["*"])
-        resolved_arns = [
-            a.replace("{project}", project_name).replace("{region}", region)
-            for a in raw_arns
-        ]
+        if actions:
+            raw_arns      = arn_templates.get(svc, ["*"])
+            resolved_arns = [
+                a.replace("{project}", project_name).replace("{region}", region)
+                for a in raw_arns
+            ]
+            all_statements.append({
+                "sid":       _to_sid(svc),
+                "actions":   sorted(set(actions)),
+                "resources": resolved_arns,
+            })
 
-        all_statements.append({
-            "sid":       _to_sid(svc),
-            "actions":   sorted(set(actions)),
-            "resources": resolved_arns,
-        })
+        # Actions that AWS does not support resource-level permissions for (e.g. cloudwatch metrics)
+        if wildcard_actions:
+            all_statements.append({
+                "sid":       _to_sid(svc) + "Metrics",
+                "actions":   sorted(set(wildcard_actions)),
+                "resources": ["*"],
+            })
 
     if not all_statements:
         return ""
