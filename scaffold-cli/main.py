@@ -503,6 +503,9 @@ cicd:
     # ── Post-generation: scan tfvars for plaintext secrets ────────────────────
     _scan_tfvars_for_secrets(INFRA_DIR)
 
+    # ── Post-generation: Checkov quality score ────────────────────────────────
+    _run_checkov_score(INFRA_DIR)
+
     typer.secho("\n> Done.", fg=typer.colors.GREEN, bold=True)
     typer.echo(f"  Scaffold    : {INFRA_DIR.absolute()}")
     typer.echo(f"  Decisions   : {decisions_path.absolute()}")
@@ -512,6 +515,125 @@ cicd:
         "\n  Next step: run 'python scaffold-cli/main.py init-backend' to create the S3 state bucket.",
         fg=typer.colors.CYAN,
     )
+
+
+def _run_checkov_score(infra_dir: Path) -> None:
+    """
+    Run Checkov on the generated .infra/ directory and print a quality score.
+    Shows passed/failed counts + percentage with colour coding.
+    Silently skips if checkov is not installed (prints install hint instead).
+    """
+    import subprocess, re as _re, shutil, sys
+
+    typer.secho("\n> Checkov quality scan...", fg=typer.colors.BLUE, bold=True)
+
+    # Resolve checkov: prefer PATH binary, fall back to python -m checkov
+    _checkov_cmd: list
+    if shutil.which("checkov"):
+        _checkov_cmd = ["checkov"]
+    else:
+        # Try running via current interpreter (works when installed in same venv)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "checkov", "--version"],
+                capture_output=True, timeout=10,
+            )
+            _checkov_cmd = [sys.executable, "-m", "checkov"]
+        except Exception:
+            _checkov_cmd = []
+
+    if not _checkov_cmd:
+        typer.secho(
+            "  [!] Checkov not found — install it to see your scaffold quality score:\n"
+            "      pip install checkov\n"
+            "  Then re-run: python scaffold-cli/main.py init --yes",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    try:
+        result = subprocess.run(
+            _checkov_cmd + [
+                "--directory", str(infra_dir),
+                "--framework", "terraform",
+                "--compact",
+                "--quiet",
+                "--output", "cli",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        typer.secho("  [!] Checkov timed out (>120s). Run manually: checkov -d .infra", fg=typer.colors.YELLOW)
+        return
+    except Exception as exc:
+        typer.secho(f"  [!] Checkov error: {exc}", fg=typer.colors.YELLOW)
+        return
+
+    # Parse: "Passed checks: 45, Failed checks: 8, Skipped checks: 2"
+    match = _re.search(
+        r"Passed checks:\s*(\d+),\s*Failed checks:\s*(\d+)",
+        output,
+    )
+    if not match:
+        typer.secho("  [!] Could not parse Checkov output. Run manually: checkov -d .infra", fg=typer.colors.YELLOW)
+        return
+
+    passed = int(match.group(1))
+    failed = int(match.group(2))
+    total  = passed + failed
+    score  = round((passed / total) * 100) if total > 0 else 0
+
+    # Colour thresholds
+    if score >= 80:
+        color = typer.colors.GREEN
+        label = "GOOD"
+    elif score >= 60:
+        color = typer.colors.YELLOW
+        label = "NEEDS WORK"
+    else:
+        color = typer.colors.RED
+        label = "ACTION REQUIRED"
+
+    bar_filled = round(score / 5)   # 20-char bar
+    bar = "#" * bar_filled + "-" * (20 - bar_filled)
+
+    typer.secho(
+        f"\n  Quality Score  [{bar}]  {score}%  ({label})",
+        fg=color, bold=True,
+    )
+    typer.echo(f"  Passed : {passed}")
+    typer.echo(f"  Failed : {failed}")
+    typer.echo(f"  Total  : {total} checks")
+
+    if failed > 0:
+        # Extract failed check IDs for a quick summary
+        failed_ids = _re.findall(r"Check:\s*(CKV[_A-Z0-9]+)", output)
+        unique_ids = list(dict.fromkeys(failed_ids))[:8]   # top 8, deduplicated
+        if unique_ids:
+            typer.secho("\n  Top failed checks (fix these to raise your score):", fg=typer.colors.YELLOW)
+            for cid in unique_ids:
+                typer.echo(f"    - {cid}  https://docs.bridgecrew.io/docs/{cid.lower()}")
+
+    typer.secho(
+        "\n  Full report: checkov -d .infra --framework terraform",
+        fg=typer.colors.CYAN,
+    )
+
+    # Write score summary to .infra/checkov-report.txt
+    report_lines = [
+        f"Checkov Quality Score: {score}% ({label})",
+        f"Passed : {passed}",
+        f"Failed : {failed}",
+        f"Total  : {total} checks",
+        "",
+        "Full CLI output:",
+        output,
+    ]
+    (infra_dir / "checkov-report.txt").write_text("\n".join(report_lines), encoding="utf-8")
+    typer.echo(f"  Report saved: {(infra_dir / 'checkov-report.txt').absolute()}")
 
 
 def _scan_tfvars_for_secrets(infra_dir: Path) -> None:
