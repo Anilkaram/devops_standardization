@@ -41,6 +41,30 @@ def _load_yaml(path: str = "infra.yaml") -> dict:
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
+def _normalize_services(config: dict) -> None:
+    """Flatten service entries to plain strings, in place.
+
+    A service in infra.yaml may be written as a plain string ('ec2') or as a
+    single-key mapping carrying inline config ('- ec2: {instance_type: ...}').
+    YAML parses the latter as a dict, which is unhashable and breaks the
+    set-membership checks throughout the CLI. Normalize both forms to the
+    service name string; per-service sizing is read from `environments`.
+    """
+    services = config.get("services")
+    if not isinstance(services, list):
+        return
+    normalized: list[str] = []
+    for entry in services:
+        if isinstance(entry, str):
+            normalized.append(entry)
+        elif isinstance(entry, dict) and len(entry) == 1:
+            normalized.append(next(iter(entry)))          # take the single key
+        elif isinstance(entry, dict) and entry:
+            normalized.append(next(iter(entry)))          # multi-key: take first key
+        # silently drop None / empty entries
+    config["services"] = normalized
+
+
 def _validate_name(name: str):
     if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$', name) or len(name) > 20:
         typer.secho(
@@ -157,6 +181,7 @@ def init(
 
     # ── Load infra.yaml (may be empty / not exist) ────────────────────────────
     config = _load_yaml()
+    _normalize_services(config)
 
     # ── --describe: AI extraction fills in what infra.yaml doesn't have ───────
     if describe:

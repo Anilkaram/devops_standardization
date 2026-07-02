@@ -509,9 +509,10 @@ def generate_scaffold(
         typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
                     fg=typer.colors.GREEN)
 
-        svc_base = dg._base_svc(svc, catalog)
+        # Resolve base type — plain 'ec2' has no suffix so _base_svc returns None
+        svc_base = dg._base_svc(svc, catalog) or svc
         if svc_base == "ec2":
-            # Role-suffixed EC2 fleet: each instance gets its own prefixed sizing vars
+            # EC2 (plain or role-suffixed) — each instance gets its own prefixed sizing vars
             call = _ec2_module_call_block(mod_name)
             _inject_ec2_instance_vars(svc, mod_name, environments, dynamic_vars)
         else:
@@ -658,6 +659,13 @@ def generate_scaffold(
                 _write_service_module(modules_dir, "kms", hcl)
                 service_module_calls.append(_service_module_call("kms"))
                 typer.secho("  + modules/kms/  [auto-added]", fg=typer.colors.GREEN)
+                # The module call references var.kms_deletion_window_days — declare it.
+                if not any(d["name"] == "kms_deletion_window_days" for d in dynamic_vars):
+                    dynamic_vars.append(
+                        {"name": "kms_deletion_window_days", "type": "number",
+                         "description": "KMS key deletion window in days (7-30)",
+                         "dev": 7, "staging": 14, "prod": 30}
+                    )
             except Exception as e:
                 typer.secho(f"  ! failed kms: {e}", fg=typer.colors.YELLOW)
 
@@ -2290,8 +2298,14 @@ def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") ->
         f'# Add new resources by editing tfvars only — no module code changes needed.\n\n'
     )
 
+    _TAGS_VAR_FALLBACK = (
+        'variable "tags" {\n'
+        '  type    = map(string)\n'
+        '  default = {}\n'
+        '}\n'
+    )
     main_hcl   = _MODULE_MAIN_HCL.get(svc, f'# TODO: add {svc} resources here\n')
-    vars_hcl   = _MODULE_VARS_TF.get(svc, 'variable "tags" { type = map(string)\n  default = {} }\n')
+    vars_hcl   = _MODULE_VARS_TF.get(svc, _TAGS_VAR_FALLBACK)
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
     (mod_dir / "main.tf").write_text(header + main_hcl,  encoding="utf-8")
@@ -2537,13 +2551,9 @@ variable "sns" {
   default = null
 }
 ''',
-        "kms": '''\
-variable "kms_deletion_window_days" {
-  description = "KMS key deletion window in days (7-30)."
-  type        = number
-  default     = 7
-}
-''',
+        # NOTE: kms_deletion_window_days is declared via the scalar-var path
+        # (_SCALAR_SVC_VARS["kms"]) so it carries per-env values. Do NOT declare
+        # it here too — that produced a duplicate variable declaration.
         "ecr": '''\
 variable "ecr_repositories" {
   description = "Map of ECR repositories. Add a repo by adding one block here."
