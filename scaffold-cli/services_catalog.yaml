@@ -149,7 +149,7 @@ services:
       db_engine: postgres
       db_engine_version: "16.4"
     iam_actions:
-      - rds-db:connect
+      - rds-db:connect   # scoped to iam_resource_arns.postgres ARN pattern
 
   mysql:
     category: database
@@ -161,7 +161,7 @@ services:
       db_engine: mysql
       db_engine_version: "8.0"
     iam_actions:
-      - rds-db:connect
+      - rds-db:connect   # scoped to iam_resource_arns.mysql ARN pattern
 
   aurora-postgres:
     category: database
@@ -577,8 +577,10 @@ compute_rules:
     - [lambda, ecs-fargate]
     - [lambda, ec2]
     - [ecs-fargate, eks]
+    - [ec2, ecs-fargate]
     - [lambda, eks, ec2]
     - [lambda, ecs-fargate, ec2]
+    - [ec2, ecs-fargate, eks]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IAM resource ARN patterns (used by dynamic IAM generator)
@@ -600,6 +602,10 @@ iam_resource_arns:
   lambda:          ["arn:aws:lambda:{region}:*:function:{project}-*"]
   sagemaker:       ["arn:aws:sagemaker:{region}:*:endpoint/{project}-*"]
   bedrock:         ["arn:aws:bedrock:*::foundation-model/*"]
+  postgres:        ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
+  mysql:           ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
+  aurora-postgres: ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
+  aurora-mysql:    ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
   polly:           ["*"]
   rekognition:     ["*"]
   textract:        ["*"]

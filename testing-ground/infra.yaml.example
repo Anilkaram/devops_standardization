@@ -9,27 +9,27 @@
 #   {project.name}-{environment}-{resource-suffix}
 #
 # Separator rules:
-#   Hyphen   -   resource names       e.g. protecto-platform-dev-func
-#   Slash    /   path-based names     e.g. protecto-platform/dev/app  (Secrets Manager, log groups)
+#   Hyphen   -   resource names       e.g. doc-api-platform-dev-func
+#   Slash    /   path-based names     e.g. doc-api-platform/dev/app  (Secrets Manager, log groups)
 #   Snake    _   Terraform variables  e.g. lambda_timeout, eks_node_count
 #
-# Resource name examples (using project.name = "protecto-platform"):
+# Resource name examples (using project.name = "doc-api-platform"):
 #
-#   Lambda function          protecto-platform-dev-func
-#   Lambda IAM role          protecto-platform-dev-lambda-role
-#   EKS cluster              protecto-platform-dev-eks
-#   EKS cluster IAM role     protecto-platform-dev-eks-cluster-role
-#   EKS node group           protecto-platform-dev-ng
-#   ECR repository           protecto-platform-dev-app
-#   SQS queue                protecto-platform-dev-queue
-#   SQS dead-letter queue    protecto-platform-dev-dlq
-#   SNS topic                protecto-platform-dev-notifications
-#   KMS key alias            alias/protecto-platform-dev
-#   Secrets Manager (app)    protecto-platform/dev/app
-#   Secrets Manager (eks)    protecto-platform/dev/eks-auth
-#   CloudWatch log group     /aws/lambda/protecto-platform-dev-func
-#   CloudWatch dashboard     protecto-platform-dev
-#   CloudWatch alarm         protecto-platform-dev-lambda-errors
+#   Lambda function          doc-api-platform-dev-func
+#   Lambda IAM role          doc-api-platform-dev-lambda-role
+#   EKS cluster              doc-api-platform-dev-eks
+#   EKS cluster IAM role     doc-api-platform-dev-eks-cluster-role
+#   EKS node group           doc-api-platform-dev-ng
+#   ECR repository           doc-api-platform-dev-app
+#   SQS queue                doc-api-platform-dev-queue
+#   SQS dead-letter queue    doc-api-platform-dev-dlq
+#   SNS topic                doc-api-platform-dev-notifications
+#   KMS key alias            alias/doc-api-platform-dev
+#   Secrets Manager (app)    doc-api-platform/dev/app
+#   Secrets Manager (eks)    doc-api-platform/dev/eks-auth
+#   CloudWatch log group     /aws/lambda/doc-api-platform-dev-func
+#   CloudWatch dashboard     doc-api-platform-dev
+#   CloudWatch alarm         doc-api-platform-dev-lambda-errors
 #
 # FIELD RULES
 # ───────────

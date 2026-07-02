@@ -174,6 +174,14 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
         {"name": "alb_idle_timeout", "type": "number",
          "description": "ALB connection idle timeout in seconds",
          "dev": 60, "staging": 60, "prod": 60},
+        {"name": "alb_certificate_arn", "type": "string",
+         "description": "ACM certificate ARN for the HTTPS listener (TLS 1.2+)",
+         "dev": "REPLACE_WITH_ACM_CERT_ARN", "staging": "REPLACE_WITH_ACM_CERT_ARN",
+         "prod": "REPLACE_WITH_ACM_CERT_ARN"},
+        {"name": "alb_access_logs_bucket", "type": "string",
+         "description": "S3 bucket name for ALB access logs",
+         "dev": "REPLACE_WITH_LOG_BUCKET", "staging": "REPLACE_WITH_LOG_BUCKET",
+         "prod": "REPLACE_WITH_LOG_BUCKET"},
     ],
     "opensearch": [
         {"name": "opensearch_instance_type",  "type": "string",
@@ -239,6 +247,18 @@ def _implicit_connections(services: list, compute_target: str) -> set:
         if store in s:
             conns.add(f"{compute_target}->{store}")
     return conns
+
+
+# """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+# Catalog entry lookup — supports role-suffixed service names (ec2-java → ec2)
+# """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+def _catalog_entry(catalog_services: dict, svc: str) -> dict:
+    """Return the catalog entry for *svc*, falling back to base name for suffixed names."""
+    if svc in catalog_services:
+        return catalog_services[svc]
+    base = dg._base_svc(svc, {"services": catalog_services})
+    return catalog_services.get(base, {}) if base else {}
 
 
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -310,10 +330,10 @@ def generate_scaffold(
     env_names    = list(environments.keys()) if environments else ["dev", "staging", "prod"]
 
     # "" Resolve services from catalog """"""""""""""""""""""""""""""""""""""
-    compute_service_names = dg.get_compute_services(catalog)
-    compute_list          = [s for s in services if s in compute_service_names]
-    compute_target        = compute_list[0]
-    other_services        = [s for s in services if s not in compute_service_names]
+    compute_list   = dg.resolve_compute_services(services, catalog)
+    compute_target = compute_list[0]
+    compute_set    = set(compute_list)
+    other_services = [s for s in services if s not in compute_set]
 
     catalog_services = catalog.get("services", {})
     ingress_svcs     = {
@@ -356,7 +376,25 @@ def generate_scaffold(
     }
     for tf_file in base.glob("*.tf"):
         if tf_file.name not in _FIXED_TF_FILES:
-            tf_file.unlink()  # removes stale service files AND the old data.tf
+            tf_file.unlink()
+
+    # Clean up stale module directories — remove any modules/ subdir whose name
+    # does NOT correspond to a service in the current run.  This prevents old
+    # s3_java/ s3_php/ directories from lingering after S3 is consolidated.
+    _modules_dir = base / "modules"
+    if _modules_dir.exists():
+        import shutil
+        # Build set of module dir names the current run will write
+        _expected_mods: set[str] = set()
+        for _svc in services:
+            _svc_base = dg._base_svc(_svc, catalog) or _svc
+            if _svc_base in {"s3"}:                     # consolidated → base name only
+                _expected_mods.add(_svc_base.replace("-", "_"))
+            else:
+                _expected_mods.add(_svc.replace("-", "_"))
+        for _mod_dir in _modules_dir.iterdir():
+            if _mod_dir.is_dir() and _mod_dir.name not in _expected_mods:
+                shutil.rmtree(_mod_dir)
 
     # modules/ -- one sub-folder per local reusable module
     _write_modules_scaffold(base, services)
@@ -396,8 +434,12 @@ def generate_scaffold(
     dynamic_vars: list[dict] = []
 
     for svc in compute_list + list(other_services):
-        if svc in STATIC_SERVICE_VARS:
-            dynamic_vars.extend(STATIC_SERVICE_VARS[svc])
+        # Support both exact names ('eks') and role-suffixed names ('ec2-java')
+        lookup_key = svc if svc in STATIC_SERVICE_VARS else (
+            dg._base_svc(svc, catalog) or svc
+        )
+        if lookup_key in STATIC_SERVICE_VARS:
+            dynamic_vars.extend(STATIC_SERVICE_VARS[lookup_key])
 
     # "" provider.tf """""""""""""""""""""""""""""""""""""""""""""""""""""""
     _write_provider_tf(base, project_name, region, owner, catalog)
@@ -418,11 +460,12 @@ def generate_scaffold(
     rendered_hcl: dict[str, str] = {}
 
     for c in compute_list:
-        entry    = catalog_services.get(c, {})
+        entry    = _catalog_entry(catalog_services, c)
         template = entry.get("template")
-        if c in _MODULE_MAIN_HCL:
+        _hcl_key = c if c in _MODULE_MAIN_HCL else (dg._base_svc(c, catalog) or c)
+        if _hcl_key in _MODULE_MAIN_HCL:
             # Hardened static template takes priority — guaranteed Checkov compliance
-            rendered_hcl[c] = _MODULE_MAIN_HCL[c]
+            rendered_hcl[c] = _MODULE_MAIN_HCL[_hcl_key]
         elif template:
             compute_templates.append(template)
             compute_labels.append(c)
@@ -463,7 +506,16 @@ def generate_scaffold(
         mod_name = _SVC_TO_MODULE.get(svc, svc.replace("-", "_"))
         svc_var_names = [v["name"] for v in dynamic_vars if v.get("service") == svc]
         _write_module_dir(modules_dir, mod_name, hcl, svc_var_names)
-        call = _module_call_block(mod_name, svc_var_names)
+        typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
+                    fg=typer.colors.GREEN)
+
+        svc_base = dg._base_svc(svc, catalog)
+        if svc_base == "ec2":
+            # Role-suffixed EC2 fleet: each instance gets its own prefixed sizing vars
+            call = _ec2_module_call_block(mod_name)
+            _inject_ec2_instance_vars(svc, mod_name, environments, dynamic_vars)
+        else:
+            call = _module_call_block(mod_name, svc_var_names)
 
         # Wire cross-module connections: pass outputs from upstream modules as inputs
         call = _inject_connection_wiring(call, mod_name, services, connections)
@@ -523,11 +575,29 @@ def generate_scaffold(
     service_module_calls: list[str] = []   # collected → appended to root main.tf
     wrote_any_service = False
 
+    # Services where multiple role-suffixed instances share ONE consolidated module.
+    # e.g. s3-java, s3-php, s3-doc, s3-ui → single modules/s3/ with for_each over buckets map.
+    _CONSOLIDATE_BASES: set[str] = {"s3"}
+    _consolidated_written: set[str] = set()   # track which base modules already written
+
     for svc in other_services:
         if svc in ingress_keys:
             continue
 
-        entry    = catalog_services.get(svc, {})
+        svc_base = dg._base_svc(svc, catalog) or svc
+
+        # ── Consolidated module (all s3-* → one modules/s3/) ────────────────────
+        if svc_base in _CONSOLIDATE_BASES:
+            if svc_base not in _consolidated_written:
+                _consolidated_written.add(svc_base)
+                _write_service_module(modules_dir, svc_base, "")
+                service_module_calls.append(_service_module_call(svc_base))
+                # Build s3_buckets map from all role-suffixed s3 services
+                _inject_s3_buckets_var(svc_base, other_services, project_name, environments, dynamic_vars)
+                wrote_any_service = True
+            continue   # skip per-instance module creation
+
+        entry    = _catalog_entry(catalog_services, svc)
         template = entry.get("template")
 
         if template:
@@ -541,12 +611,13 @@ def generate_scaffold(
             except Exception as e:
                 typer.secho(f"  ! failed {svc} ({template}): {e}", fg=typer.colors.YELLOW)
         else:
-            fallback_entry = entry if svc in catalog_services else {
+            has_base = bool(entry)  # truthy when base-name lookup succeeded
+            fallback_entry = entry if has_base else {
                 "terraform_resource": f"aws_{svc.replace('-', '_')}",
                 "category": "unknown",
                 "iam_actions": [],
             }
-            if svc not in catalog_services:
+            if not has_base:
                 typer.secho(
                     f"  ~ '{svc}' not in catalog -- attempting AI generation...",
                     fg=typer.colors.BLUE,
@@ -696,6 +767,18 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
     ],
+    # ec2 sizing vars are prefixed per-instance at call-site (var.ec2_java_instance_type)
+    # so the RHS here uses a placeholder "__PREFIX__" that gets substituted at runtime.
+    "ec2": [
+        ("name_prefix",           "string",       ""),           # computed from mod_name
+        ("instance_type",         "string",       ""),           # prefixed var
+        ("ami_id",                "string",       ""),           # prefixed var
+        ("subnet_id",             "string",       "module.vpc.private_subnets[0]"),
+        ("security_group_id",     "string",       "aws_security_group.app.id"),
+        ("kms_key_arn",           "string",       "try(module.kms.key_arn, null)"),
+        ("instance_profile_name", "string",       'try(aws_iam_instance_profile.ec2.name, null)'),
+        ("tags",                  "map(string)",  "local.common_tags"),
+    ],
 }
 
 # Modules that depend on root-level IAM policy attachments being applied first.
@@ -741,9 +824,14 @@ def _write_module_dir(
     (mod_dir / "main.tf").write_text(header + resource_hcl, encoding="utf-8")
 
     # variables.tf -- use pre-written vars if this module has a static _MODULE_VARS_TF entry
-    if mod_name in _MODULE_VARS_TF:
-        (mod_dir / "variables.tf").write_text(_MODULE_VARS_TF[mod_name], encoding="utf-8")
-        outputs_hcl = _MODULE_OUTPUTS_TF.get(mod_name, f"# Add outputs for the {mod_name} module.\n")
+    # Support role-suffixed module names (ec2_java → look up ec2)
+    _vars_key = mod_name if mod_name in _MODULE_VARS_TF else (
+        dg._base_svc(mod_name.replace("_", "-"), {"services": {k: {} for k in _MODULE_VARS_TF}})
+        or mod_name
+    )
+    if _vars_key in _MODULE_VARS_TF:
+        (mod_dir / "variables.tf").write_text(_MODULE_VARS_TF[_vars_key], encoding="utf-8")
+        outputs_hcl = _MODULE_OUTPUTS_TF.get(_vars_key, f"# Add outputs for the {mod_name} module.\n")
         (mod_dir / "outputs.tf").write_text(outputs_hcl, encoding="utf-8")
         return
 
@@ -908,6 +996,120 @@ def _inject_connection_wiring(call_block: str, mod_name: str,
     # Insert extra_lines before the closing }
     block_lines = call_block.rstrip().split("\n")
     return "\n".join(block_lines[:-1] + extra_lines + [block_lines[-1]]) + "\n"
+
+
+def _inject_s3_buckets_var(
+    base: str,
+    all_services: list[str],
+    project_name: str,
+    environments: dict,
+    dynamic_vars: list[dict],
+) -> None:
+    """Build the s3_buckets map(object) variable from all role-suffixed s3 services.
+
+    Each svc like 's3-java' → bucket key 'java' in the map.
+    Per-env bucket names include the environment suffix.
+    Reads lifecycle_days and versioning from environments config if present.
+    """
+    roles = [
+        svc.split("-", 1)[1]
+        for svc in all_services
+        if dg._base_svc(svc, {"services": {base: {}}}) == base
+    ]
+    if not roles:
+        return
+
+    # Build one var dict per environment — stored as an obj_block (not a scalar)
+    # We store it as a special type "s3_map" that the tfvars writer renders as HCL block
+    env_defaults: dict[str, dict] = {}
+    for env_name, env_cfg in environments.items():
+        role_cfgs: dict[str, dict] = {}
+        for role in roles:
+            svc_cfg = env_cfg.get(f"{base}-{role}", {})
+            role_cfgs[role] = {
+                "name":           f"{project_name}-{env_name}-{role}",
+                "versioning":     svc_cfg.get("versioning", True),
+                "lifecycle_days": svc_cfg.get("lifecycle_days", 90),
+                "force_destroy":  svc_cfg.get("force_destroy", False),
+            }
+        env_defaults[env_name] = role_cfgs
+
+    var: dict = {
+        "name":        "s3_buckets",
+        "type":        "s3_map",        # sentinel: rendered as HCL map block by tfvars writer
+        "description": f"Map of S3 buckets ({', '.join(roles)}). Key = role, value = bucket config.",
+        "_env_values": env_defaults,    # private key used by tfvars writer
+    }
+    if not any(d["name"] == "s3_buckets" for d in dynamic_vars):
+        dynamic_vars.append(var)
+
+
+def _ec2_module_call_block(mod_name: str) -> str:
+    """Generate root main.tf module call for a role-suffixed EC2 fleet.
+
+    Each fleet (ec2_java, ec2_php, ec2_doc) gets its own prefixed sizing variables
+    so all three can coexist in the same tfvars file without collision:
+      ec2_java_instance_type = "t3.medium"
+      ec2_php_instance_type  = "t3.medium"
+      ec2_doc_instance_type  = "t3.small"
+    """
+    # Extract role label (java / php / doc) from mod_name like "ec2_java"
+    parts = mod_name.split("_", 1)
+    role = parts[1] if len(parts) == 2 else mod_name
+    return (
+        f'module "{mod_name}" {{\n'
+        f'  source = "./modules/{mod_name}"\n'
+        f'\n'
+        f'  name_prefix           = "${{var.project_name}}-${{var.environment}}-{role}"\n'
+        f'  instance_type         = var.{mod_name}_instance_type\n'
+        f'  ami_id                = var.{mod_name}_ami_id\n'
+        f'  subnet_id             = module.vpc.private_subnets[0]\n'
+        f'  security_group_id     = aws_security_group.app.id\n'
+        f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
+        f'  instance_profile_name = try(aws_iam_instance_profile.ec2.name, null)\n'
+        f'  tags                  = local.common_tags\n'
+        f'}}\n'
+    )
+
+
+def _inject_ec2_instance_vars(
+    svc: str,
+    mod_name: str,
+    environments: dict,
+    dynamic_vars: list[dict],
+) -> None:
+    """Append per-instance sizing variables for a role-suffixed EC2 service.
+
+    Reads instance_type from environments.<env>.<svc>.instance_type and
+    appends prefixed variable dicts (ec2_java_instance_type etc.) to dynamic_vars
+    so they are written to both root variables.tf and each env's terraform.tfvars.
+    """
+    # Determine per-env instance_type values from environments config
+    env_types: dict[str, str] = {}
+    for env_name, env_cfg in environments.items():
+        svc_cfg = env_cfg.get(svc, {})
+        env_types[env_name] = svc_cfg.get("instance_type", "t3.medium")
+
+    # instance_type var
+    instance_type_var: dict = {
+        "name": f"{mod_name}_instance_type",
+        "type": "string",
+        "description": f"EC2 instance type for the {svc} fleet",
+    }
+    instance_type_var.update(env_types)  # adds dev/prod/staging keys
+
+    # ami_id var — always a placeholder (AMI IDs are region/account specific)
+    ami_id_var: dict = {
+        "name": f"{mod_name}_ami_id",
+        "type": "string",
+        "description": f"AMI ID for the {svc} fleet (e.g. latest Amazon Linux 2023)",
+    }
+    for env_name in environments:
+        ami_id_var[env_name] = "REPLACE_WITH_AMI_ID"
+
+    for v in (instance_type_var, ami_id_var):
+        if not any(d["name"] == v["name"] for d in dynamic_vars):
+            dynamic_vars.append(v)
 
 
 def _module_call_block(mod_name: str, svc_var_names: list[str]) -> str:
@@ -1403,6 +1605,125 @@ resource "aws_cloudwatch_dashboard" "main" {
   dashboard_body = jsonencode(var.dashboard.body)
 }
 ''',
+
+    "s3": '''\
+resource "aws_s3_bucket" "this" {
+  #checkov:skip=CKV_AWS_144:Cross-region replication is optional — enable per bucket after scaffold
+  #checkov:skip=CKV2_AWS_62:Event notifications are optional and should be configured post-scaffold
+  for_each      = var.buckets
+  bucket        = each.value.name
+  force_destroy = each.value.force_destroy
+
+  tags = merge(var.tags, { Role = each.key })
+}
+
+resource "aws_s3_bucket_versioning" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
+      kms_master_key_id = var.kms_key_arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Access logging — each bucket logs to the designated logging bucket
+resource "aws_s3_bucket_logging" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  target_bucket = var.logging_bucket_id != null ? var.logging_bucket_id : aws_s3_bucket.this[each.key].id
+  target_prefix = "s3-access-logs/${each.key}/"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  rule {
+    id     = "abort-incomplete-multipart"
+    status = "Enabled"
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
+    id     = "expire-old-objects"
+    status = each.value.lifecycle_days > 0 ? "Enabled" : "Disabled"
+
+    expiration {
+      days = each.value.lifecycle_days > 0 ? each.value.lifecycle_days : 365
+    }
+  }
+}
+''',
+
+    "ec2": '''\
+#checkov:skip=CKV_TF_1:Registry source uses semver pin; git commit hash format not supported for Terraform Registry modules
+
+module "ec2_instance" {
+  #checkov:skip=CKV_TF_1:Registry source uses semver pin; git commit hash format not supported for Terraform Registry modules
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "~> 5.0"
+
+  name          = var.name_prefix
+  instance_type = var.instance_type
+  ami           = var.ami_id
+  key_name      = var.key_name
+
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = [var.security_group_id]
+
+  # IMDSv2 required — disables IMDSv1 to prevent SSRF-based metadata access
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  # EBS root volume — encrypted with CMK
+  root_block_device = [
+    {
+      encrypted   = true
+      kms_key_id  = var.kms_key_arn
+      volume_type = "gp3"
+      volume_size = var.root_volume_size_gb
+    }
+  ]
+
+  # IAM instance profile for S3/RDS/Secrets access (created in iam.tf)
+  iam_instance_profile = var.instance_profile_name
+
+  # Monitoring
+  monitoring = true
+
+  tags = var.tags
+}
+''',
 }
 
 # variables.tf content for each service module (map(object) typed)
@@ -1692,6 +2013,91 @@ variable "tags" {
   default = {}
 }
 ''',
+
+    "s3": '''\
+variable "buckets" {
+  type = map(object({
+    name           = string
+    versioning     = bool
+    lifecycle_days = number
+    force_destroy  = bool
+  }))
+  description = "Map of S3 buckets. Key = role label (java, php, doc, ui). Each entry creates one bucket."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for SSE-KMS encryption. null = AES256 (server-managed)."
+  default     = null
+}
+
+variable "logging_bucket_id" {
+  type        = string
+  description = "S3 bucket ID to receive access logs. null = each bucket logs to itself."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "ec2": '''\
+variable "name_prefix" {
+  type        = string
+  description = "Name prefix for the EC2 instance."
+}
+
+variable "instance_type" {
+  type        = string
+  description = "EC2 instance type (e.g. t3.medium, m5.large)."
+}
+
+variable "ami_id" {
+  type        = string
+  description = "AMI ID for the EC2 instance."
+}
+
+variable "key_name" {
+  type        = string
+  description = "EC2 key pair name for SSH access."
+  default     = null
+}
+
+variable "subnet_id" {
+  type        = string
+  description = "Subnet ID to launch the instance into (private subnet recommended)."
+}
+
+variable "security_group_id" {
+  type        = string
+  description = "Security group ID to attach to the instance."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for EBS root volume encryption."
+  default     = null
+}
+
+variable "root_volume_size_gb" {
+  type        = number
+  description = "Size of the root EBS volume in GB."
+  default     = 20
+}
+
+variable "instance_profile_name" {
+  type        = string
+  description = "IAM instance profile name to attach to the EC2 instance."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
 }
 
 # outputs.tf content for each service module
@@ -1828,6 +2234,35 @@ output "dashboard_name" {
   value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
 }
 ''',
+
+    "s3": '''\
+output "bucket_arns" {
+  description = "Map of S3 bucket ARNs. Keys match the buckets input variable."
+  value       = { for k, b in aws_s3_bucket.this : k => b.arn }
+}
+
+output "bucket_names" {
+  description = "Map of S3 bucket names. Keys match the buckets input variable."
+  value       = { for k, b in aws_s3_bucket.this : k => b.id }
+}
+''',
+
+    "ec2": '''\
+output "instance_id" {
+  description = "EC2 instance ID."
+  value       = module.ec2_instance.id
+}
+
+output "private_ip" {
+  description = "Private IP address of the EC2 instance."
+  value       = module.ec2_instance.private_ip
+}
+
+output "instance_arn" {
+  description = "ARN of the EC2 instance."
+  value       = module.ec2_instance.arn
+}
+''',
 }
 
 
@@ -1874,6 +2309,14 @@ def _service_module_call(svc: str) -> str:
     """
     mod_name = svc.replace("-", "_")
     _CALLS: dict[str, str] = {
+        "s3": (
+            f'module "s3" {{\n'
+            f'  source = "./modules/s3"\n\n'
+            f'  buckets     = var.s3_buckets\n'
+            f'  kms_key_arn = try(module.kms.key_arn, null)\n'
+            f'  tags        = local.common_tags\n'
+            f'}}\n'
+        ),
         "sqs": (
             f'module "sqs" {{\n'
             f'  source = "./modules/sqs"\n\n'
@@ -2169,9 +2612,30 @@ variable "dashboard" {
     }
 
     for svc in services:
+        # Direct match
         if svc in _MAP_VARS and svc not in seen:
             seen.add(svc)
             lines.append(_MAP_VARS[svc])
+
+    # s3_buckets map var — emitted once when any s3-* service is present
+    _has_s3 = any(
+        svc == "s3" or (dg._base_svc(svc, {"services": {"s3": {}}}) == "s3")
+        for svc in services
+    )
+    if _has_s3 and "s3_buckets" not in seen:
+        seen.add("s3_buckets")
+        lines.append('''\
+variable "s3_buckets" {
+  description = "Map of S3 buckets. Key = role (java, php, doc, ui). Add a bucket by adding one block here."
+  type = map(object({
+    name           = string
+    versioning     = bool
+    lifecycle_days = number
+    force_destroy  = bool
+  }))
+  default = {}
+}
+''')
 
     # lambda_configs always added when lambda is present
     if "lambda" in services and "lambda_configs" not in seen:
@@ -2337,6 +2801,9 @@ def _write_env_files(
             if name in seen_names:
                 continue
             seen_names.add(name)
+            # s3_map vars are rendered as HCL obj_blocks, not scalar lines
+            if var.get("type") == "s3_map":
+                continue
             val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
             scalar_lines.append(_format_tfvar(name, val))
 
@@ -2350,6 +2817,27 @@ def _write_env_files(
 
         # Build map(object) blocks
         obj_blocks: list[str] = []
+
+        # ── S3 buckets map ────────────────────────────────────────────────────
+        _s3_map_vars = [v for v in service_vars if v.get("type") == "s3_map" and v["name"] == "s3_buckets"]
+        if _s3_map_vars:
+            role_cfgs = _s3_map_vars[0].get("_env_values", {}).get(env_name, {})
+            if role_cfgs:
+                bucket_lines = ["s3_buckets = {"]
+                for role, cfg in role_cfgs.items():
+                    vers = str(cfg["versioning"]).lower()
+                    ld   = cfg["lifecycle_days"]
+                    fd   = str(cfg["force_destroy"]).lower()
+                    bucket_lines += [
+                        f'  {role} = {{',
+                        f'    name           = "{cfg["name"]}"',
+                        f'    versioning     = {vers}',
+                        f'    lifecycle_days = {ld}',
+                        f'    force_destroy  = {fd}',
+                        f'  }}',
+                    ]
+                bucket_lines.append("}")
+                obj_blocks.append("# S3 bucket configurations\n# Add a new bucket by adding a block — no module code changes needed.\n" + "\n".join(bucket_lines) + "\n")
 
         if "lambda" in services:
             lambda_cfg = env_cfg.get("lambda", {})

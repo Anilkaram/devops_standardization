@@ -38,7 +38,7 @@ def _load_yaml(path: str = "infra.yaml") -> dict:
     if not p.exists():
         return {}
     typer.echo(f"> Reading {path}...")
-    return yaml.safe_load(p.read_text()) or {}
+    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
 def _validate_name(name: str):
@@ -210,7 +210,10 @@ def init(
         )
         raise typer.Exit(1)
 
-    unknown = [s for s in services if s not in valid_services]
+    unknown = [
+        s for s in services
+        if s not in valid_services and not dg._base_svc(s, catalog)
+    ]
     if unknown:
         typer.secho(
             f"  [!] Services not in catalog: {unknown}\n"
@@ -218,7 +221,7 @@ def init(
             fg=typer.colors.YELLOW,
         )
 
-    compute = [s for s in services if s in compute_services]
+    compute = dg.resolve_compute_services(services, catalog)
     if not compute:
         typer.secho(
             f"ERROR: no compute target found.\n"
@@ -228,7 +231,9 @@ def init(
         raise typer.Exit(1)
 
     max_compute = dg.get_max_compute_targets(catalog)
-    if len(compute) > max_compute:
+    # Count unique base types — ec2-java, ec2-php, ec2-doc all count as one "ec2"
+    unique_compute_types = {dg._base_svc(s, catalog) or s for s in compute}
+    if len(unique_compute_types) > max_compute:
         typer.secho(
             f"ERROR: too many compute targets: {compute}\n"
             f"  Maximum {max_compute} compute services allowed.",
@@ -247,7 +252,10 @@ def init(
             )
             raise typer.Exit(1)
 
-    other_services = [s for s in services if s not in compute_services]
+    # Exclude the base-aware compute list so role-suffixed compute (ec2-java)
+    # doesn't appear in both the compute line and the services line.
+    _compute_set   = set(compute)
+    other_services = [s for s in services if s not in _compute_set]
     flows          = config.get("flows", {})
 
     # ── Print summary ─────────────────────────────────────────────────────────
@@ -260,8 +268,8 @@ def init(
     typer.echo(f"  stage          = {config.get('stage', 'not set')}")
     typer.echo(f"  compute        = {' + '.join(compute)}")
     if other_services:
-        known   = [s for s in other_services if s in valid_services]
-        dynamic = [s for s in other_services if s not in valid_services]
+        known   = [s for s in other_services if s in valid_services or dg._base_svc(s, catalog)]
+        dynamic = [s for s in other_services if s not in valid_services and not dg._base_svc(s, catalog)]
         if known:
             typer.echo(f"  services       = {', '.join(known)}")
         if dynamic:

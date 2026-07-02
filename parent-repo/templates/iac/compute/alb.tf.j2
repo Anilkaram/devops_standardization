@@ -1,10 +1,21 @@
-# ALB — ingress for web-api (Section 9)
+# ALB — hardened ingress for web-api
 resource "aws_lb" "main" {
+  #checkov:skip=CKV2_AWS_28:WAF association is attached separately via the waf module when present; add aws_wafv2_web_acl_association referencing this ALB ARN
   name               = "{{ project_name }}-${var.environment}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.app.id]
   subnets            = aws_subnet.public[*].id
+
+  # Security hardening
+  drop_invalid_header_fields = true          # CKV_AWS_131
+  enable_deletion_protection = true          # CKV_AWS_150
+
+  access_logs {                              # CKV_AWS_91
+    bucket  = var.alb_access_logs_bucket
+    prefix  = "alb"
+    enabled = true
+  }
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-alb"
@@ -15,14 +26,14 @@ resource "aws_lb" "main" {
 
 resource "aws_lb_target_group" "app" {
   name        = "{{ project_name }}-${var.environment}-tg"
-  port        = 8080
-  protocol    = "HTTP"
+  port        = 443
+  protocol    = "HTTPS"
   vpc_id      = aws_vpc.main.id
   target_type = "ip"
 
   health_check {
     path                = "/health"
-    protocol            = "HTTP"
+    protocol            = "HTTPS"
     matcher             = "200"
     interval            = 30
     healthy_threshold   = 2
@@ -36,13 +47,33 @@ resource "aws_lb_target_group" "app" {
   }
 }
 
+# HTTPS listener — TLS 1.2+ (CKV_AWS_2, CKV_AWS_103, CKV_AWS_378)
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.alb_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# HTTP listener — redirects everything to HTTPS (CKV2_AWS_20)
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
   }
 }
