@@ -24,9 +24,7 @@ resource "aws_apigatewayv2_api" "main" {
 resource "aws_cloudwatch_log_group" "api_gw" {
   name              = "/aws/apigateway/{{ project_name }}-${var.environment}"
   retention_in_days = var.log_retention_days
-  {% if 'kms' in services %}
-  kms_key_id = aws_kms_key.main.arn
-  {% endif %}
+  kms_key_id        = var.kms_key_arn
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-apigw-logs"
@@ -107,12 +105,4 @@ resource "aws_apigatewayv2_authorizer" "cognito" {
 }
 {% endif %}
 
-output "api_endpoint" {
-  description = "API Gateway v2 invoke URL"
-  value       = aws_apigatewayv2_stage.default.invoke_url
-}
 
-output "api_execution_arn" {
-  description = "API Gateway execution ARN (used for Lambda permission source_arn)"
-  value       = aws_apigatewayv2_api.main.execution_arn
-}

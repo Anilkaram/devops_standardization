@@ -98,6 +98,13 @@ def _normalise_config(config: dict) -> dict:
         if owner:
             config.setdefault("project", {})["owner"] = owner
 
+    # Normalize services: support both list-of-strings and list-of-dicts with 'type' keys
+    raw_services = config.get("services", [])
+    if raw_services and isinstance(raw_services[0], dict):
+        # New schema: preserve original instances, extract types for generator compatibility
+        config["service_instances"] = raw_services
+        config["services"] = list(dict.fromkeys(s["type"] for s in raw_services))
+
     # data.stores → services list integration
     data_stores = config.get("data", {}).get("stores", [])
     if data_stores:

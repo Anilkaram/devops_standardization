@@ -564,19 +564,6 @@ def generate_scaffold(
                 dynamic_vars.extend(svc_vars)
                 wrote_any_service = True
 
-        # Inject scalar sizing vars for this service (kms_deletion_window_days etc.)
-        _SCALAR_SVC_VARS: dict[str, list[dict]] = {
-            "kms": [
-                {"name": "kms_deletion_window_days", "type": "number",
-                 "description": "KMS key deletion window in days (7-30)",
-                 "dev": 7, "staging": 14, "prod": 30},
-            ],
-        }
-        if svc in _SCALAR_SVC_VARS:
-            for v in _SCALAR_SVC_VARS[svc]:
-                if not any(d["name"] == v["name"] for d in dynamic_vars):
-                    dynamic_vars.append(v)
-
     # Auto-add kms module when KMS is needed but not explicitly listed
     if wrote_any_service and "kms" not in services:
         kms_entry    = catalog_services.get("kms", {})
@@ -653,8 +640,8 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("log_retention_days",      "number",      "var.log_retention_days"),
         # Optional service module outputs passed in when those services are present
         ("secrets_manager_arn",     "string",      'try(module.secrets_manager.secret_arn, null)'),
-        ("sns_topic_arn",           "string",      'try(module.sns.topic_arn, null)'),
-        ("sqs_queue_url",           "string",      'try(module.sqs.queue_url, null)'),
+        ("sns_topic_arn",           "string",      "null"),
+        ("sqs_queue_url",           "string",      "null"),
         # Universal
         ("environment",             "string",      "var.environment"),
         ("region",                  "string",      "var.region"),
@@ -673,7 +660,7 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         # Cross-module deps — live in root networking.tf (module.vpc)
         ("subnet_private_ids",    "list(string)", "module.vpc.private_subnets"),
         ("subnet_public_ids",     "list(string)", "module.vpc.public_subnets"),
-        ("security_group_id",     "string",       "aws_security_group.app.id"),
+        ("security_group_id",     "string",       "null"),
         # Universal
         ("environment",           "string",       "var.environment"),
         ("region",                "string",       "var.region"),
@@ -695,6 +682,15 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("region",        "string",      "var.region"),
         ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
+    ],
+    "api_gateway": [
+        ("environment",          "string", "var.environment"),
+        ("app_domain",           "string", '""'),
+        ("cost_centre",          "string", "var.cost_centre"),
+        ("log_retention_days",   "number", "var.log_retention_days"),
+        ("kms_key_arn",          "string", "try(module.kms.key_arn, null)"),
+        ("lambda_invoke_arn",    "string", "module.lambda.invoke_arn"),
+        ("lambda_function_name", "string", "module.lambda.function_name"),
     ],
 }
 
@@ -719,6 +715,7 @@ _SVC_TO_MODULE: dict[str, str] = {
     "ecs-fargate": "ecs",
     "rds":         "rds",
     "aurora":      "rds",
+    "api-gateway": "api_gateway",
 }
 
 
@@ -905,9 +902,24 @@ def _inject_connection_wiring(call_block: str, mod_name: str,
     if not extra_lines:
         return call_block
 
-    # Insert extra_lines before the closing }
+    # Insert extra_lines before the closing }, skipping any that define a var already set
+    import re
     block_lines = call_block.rstrip().split("\n")
-    return "\n".join(block_lines[:-1] + extra_lines + [block_lines[-1]]) + "\n"
+    # Extract variable names already present in the block (e.g. "lambda_invoke_arn" from "  lambda_invoke_arn = ...")
+    existing_vars = set()
+    for line in block_lines:
+        m = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=', line)
+        if m:
+            existing_vars.add(m.group(1))
+    new_lines = []
+    for ln in extra_lines:
+        m = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=', ln)
+        if m and m.group(1) in existing_vars:
+            continue
+        new_lines.append(ln)
+    if not new_lines:
+        return call_block
+    return "\n".join(block_lines[:-1] + new_lines + [block_lines[-1]]) + "\n"
 
 
 def _module_call_block(mod_name: str, svc_var_names: list[str]) -> str:
@@ -958,7 +970,7 @@ _MODULE_MAIN_HCL: dict[str, str] = {
     "lambda": '''\
 resource "aws_lambda_function" "app" {
   #checkov:skip=CKV_AWS_272:code_signing_config_arn requires a pre-created signing profile — set var.code_signing_config_arn when ready
-  function_name = "${local.name_prefix}-func"
+  function_name = "${var.name_prefix}-func"
   role          = var.lambda_exec_role_arn
 
   s3_bucket = var.lambda_s3_bucket
@@ -1005,23 +1017,23 @@ resource "aws_lambda_function" "app" {
     }
   }
 
-  tags = local.common_tags
+  tags = var.tags
 
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${local.name_prefix}-func"
+  name              = "/aws/lambda/${var.name_prefix}-func"
   retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
 
-  tags = local.common_tags
+  tags = var.tags
 }
 ''',
 
     "eks": '''\
 resource "aws_eks_cluster" "main" {
-  name     = "${local.name_prefix}-eks"
+  name     = "${var.name_prefix}-eks"
   role_arn = var.eks_cluster_role_arn
   version  = var.eks_cluster_version
 
@@ -1056,12 +1068,12 @@ resource "aws_eks_cluster" "main" {
     support_type = "EXTENDED"
   }
 
-  tags = local.common_tags
+  tags = var.tags
 }
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${local.name_prefix}-ng"
+  node_group_name = "${var.name_prefix}-ng"
   node_role_arn   = var.eks_node_role_arn
   subnet_ids      = var.subnet_private_ids
 
@@ -1086,7 +1098,7 @@ resource "aws_eks_node_group" "main" {
     NodeGroup   = "main"
   }
 
-  tags = local.common_tags
+  tags = var.tags
 }
 ''',
 
@@ -1420,10 +1432,22 @@ variable "region" { type = string }
 variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
-variable "kms_key_arn" { type = string; default = null }
-variable "secrets_manager_arn" { type = string; default = null }
-variable "sns_topic_arn" { type = string; default = null }
-variable "sqs_queue_url" { type = string; default = null }
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+variable "secrets_manager_arn" {
+  type    = string
+  default = null
+}
+variable "sns_topic_arn" {
+  type    = string
+  default = null
+}
+variable "sqs_queue_url" {
+  type    = string
+  default = null
+}
 variable "dlq_arn" {
   description = "ARN of the Dead Letter Queue for failed Lambda invocations."
   type        = string
@@ -1434,7 +1458,10 @@ variable "subnet_private_ids" {
   type        = list(string)
   default     = []
 }
-variable "security_group_id" { type = string; default = null }
+variable "security_group_id" {
+  type    = string
+  default = null
+}
 variable "reserved_concurrency" {
   description = "Reserved concurrent executions (-1 = unrestricted)."
   type        = number
@@ -1456,8 +1483,14 @@ variable "region" { type = string }
 variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
-variable "kms_key_arn" { type = string; default = null }
-variable "security_group_id" { type = string; default = null }
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+variable "security_group_id" {
+  type    = string
+  default = null
+}
 variable "eks_public_access_cidrs" {
   description = "CIDR blocks allowed to reach the EKS public API endpoint."
   type        = list(string)
@@ -1692,6 +1725,58 @@ variable "tags" {
   default = {}
 }
 ''',
+
+    "api_gateway": '''\
+variable "environment" {
+  description = "Deployment environment"
+  type        = string
+}
+
+variable "app_domain" {
+  description = "Application domain for CORS configuration"
+  type        = string
+  default     = ""
+}
+
+variable "cost_centre" {
+  description = "Cost centre for tagging"
+  type        = string
+}
+
+variable "log_retention_days" {
+  description = "CloudWatch log retention in days"
+  type        = number
+  default     = 7
+}
+
+variable "lambda_invoke_arn" {
+  description = "Lambda invoke ARN for API Gateway integration"
+  type        = string
+}
+
+variable "lambda_function_name" {
+  description = "Lambda function name for permission"
+  type        = string
+}
+
+variable "kms_key_arn" {
+  description = "KMS key ARN for CloudWatch log group encryption"
+  type        = string
+  default     = null
+}
+
+variable "cognito_client_id" {
+  description = "Cognito user pool client ID for JWT authorizer"
+  type        = string
+  default     = null
+}
+
+variable "cognito_issuer_url" {
+  description = "Cognito issuer URL for JWT authorizer"
+  type        = string
+  default     = null
+}
+''',
 }
 
 # outputs.tf content for each service module
@@ -1828,6 +1913,18 @@ output "dashboard_name" {
   value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
 }
 ''',
+
+    "api_gateway": '''\
+output "api_endpoint" {
+  description = "API Gateway v2 invoke URL"
+  value       = aws_apigatewayv2_stage.default.invoke_url
+}
+
+output "api_execution_arn" {
+  description = "API Gateway execution ARN (used for Lambda permission source_arn)"
+  value       = aws_apigatewayv2_api.main.execution_arn
+}
+''',
 }
 
 
@@ -1856,7 +1953,7 @@ def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") ->
     )
 
     main_hcl   = _MODULE_MAIN_HCL.get(svc, f'# TODO: add {svc} resources here\n')
-    vars_hcl   = _MODULE_VARS_TF.get(svc, 'variable "tags" { type = map(string)\n  default = {} }\n')
+    vars_hcl   = _MODULE_VARS_TF.get(svc, 'variable "tags" {\n  type    = map(string)\n  default = {}\n}\n')
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
     (mod_dir / "main.tf").write_text(header + main_hcl,  encoding="utf-8")
@@ -1930,12 +2027,23 @@ def _service_module_call(svc: str) -> str:
             f'module "cloudwatch" {{\n'
             f'  source = "./modules/cloudwatch"\n\n'
             f'  log_retention_days = var.log_retention_days\n'
-            f'  sns_topic_arn      = try(module.sns.topic_arn, null)\n'
+            f'  sns_topic_arn      = null\n'
             f'  lambda_log_groups  = local.lambda_log_groups\n'
             f'  cloudwatch_alarms  = var.cloudwatch_alarms\n'
             f'  dashboard          = var.dashboard\n'
             f'  kms_key_arn        = try(module.kms.key_arn, null)\n'
             f'  tags               = local.common_tags\n'
+            f'}}\n'
+        ),
+        "api-gateway": (
+            f'module "api_gateway" {{\n'
+            f'  source = "./modules/api_gateway"\n\n'
+            f'  environment          = var.environment\n'
+            f'  cost_centre          = var.cost_centre\n'
+            f'  log_retention_days   = var.log_retention_days\n'
+            f'  kms_key_arn          = try(module.kms.key_arn, null)\n'
+            f'  lambda_invoke_arn    = module.lambda.invoke_arn\n'
+            f'  lambda_function_name = module.lambda.function_name\n'
             f'}}\n'
         ),
     }
@@ -2237,11 +2345,11 @@ locals {
 
   # Convenience maps used by eventbridge and cloudwatch modules
   lambda_arns = {
-    for key, fn in module.lambda : key => fn.function_arn
+    app = module.lambda.function_arn
   }
 
   lambda_function_names = {
-    for key, fn in module.lambda : key => fn.function_name
+    app = module.lambda.function_name
   }
 
   # CloudWatch log group per Lambda function
