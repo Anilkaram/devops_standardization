@@ -760,7 +760,9 @@ def is_config_complete(config: dict) -> bool:
     """
     COMPUTE = {"lambda", "ecs-fargate", "eks", "ec2", "static-site"}
     services    = config.get("services", [])
-    has_compute = any(s in COMPUTE for s in services)
+    # Support both list-of-strings and list-of-dicts (new schema with 'type' key)
+    service_types = [s["type"] if isinstance(s, dict) else s for s in services]
+    has_compute = any(s in COMPUTE for s in service_types)
     has_name    = bool(config.get("project", {}).get("name"))
     has_region  = bool(
         config.get("project", {}).get("region") or config.get("cloud", {}).get("region")

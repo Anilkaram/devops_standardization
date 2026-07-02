@@ -44,11 +44,13 @@ def _load_yaml(path: str = "infra.yaml") -> dict:
 def _normalize_services(config: dict) -> None:
     """Flatten service entries to plain strings, in place.
 
-    A service in infra.yaml may be written as a plain string ('ec2') or as a
-    single-key mapping carrying inline config ('- ec2: {instance_type: ...}').
-    YAML parses the latter as a dict, which is unhashable and breaks the
-    set-membership checks throughout the CLI. Normalize both forms to the
-    service name string; per-service sizing is read from `environments`.
+    A service in infra.yaml may be written several ways:
+      - plain string:        'ec2'
+      - type-keyed mapping:   {type: ec2, instance_type: ...}
+      - name-keyed mapping:   {ec2: {instance_type: ...}}
+    YAML parses the mapping forms as dicts, which are unhashable and break the
+    set-membership checks throughout the CLI. Normalize every form to the
+    service-name string; per-service sizing is read from `environments`.
     """
     services = config.get("services")
     if not isinstance(services, list):
@@ -57,10 +59,13 @@ def _normalize_services(config: dict) -> None:
     for entry in services:
         if isinstance(entry, str):
             normalized.append(entry)
-        elif isinstance(entry, dict) and len(entry) == 1:
-            normalized.append(next(iter(entry)))          # take the single key
         elif isinstance(entry, dict) and entry:
-            normalized.append(next(iter(entry)))          # multi-key: take first key
+            # type-keyed schema ({type: ec2, ...}) → the 'type' value is the name;
+            # otherwise it's a name-keyed mapping ({ec2: {...}}) → the key is the name.
+            if "type" in entry:
+                normalized.append(str(entry["type"]))
+            else:
+                normalized.append(next(iter(entry)))
         # silently drop None / empty entries
     config["services"] = normalized
 
@@ -121,6 +126,13 @@ def _normalise_config(config: dict) -> dict:
         owner = config.get("owner", "")
         if owner:
             config.setdefault("project", {})["owner"] = owner
+
+    # Normalize services: support both list-of-strings and list-of-dicts with 'type' keys
+    raw_services = config.get("services", [])
+    if raw_services and isinstance(raw_services[0], dict):
+        # New schema: preserve original instances, extract types for generator compatibility
+        config["service_instances"] = raw_services
+        config["services"] = list(dict.fromkeys(s["type"] for s in raw_services))
 
     # data.stores → services list integration
     data_stores = config.get("data", {}).get("stores", [])
