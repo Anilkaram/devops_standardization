@@ -87,6 +87,11 @@ def get_all_valid_services(catalog: dict) -> set[str]:
     return set(catalog.get("services", {}).keys())
 
 
+def get_infra_layer_names(catalog: dict) -> set[str]:
+    """Infra layers (vpc, iam, security_group) are auto-generated, never services."""
+    return set(catalog.get("infra_layers", {}).keys())
+
+
 def get_compute_services(catalog: dict) -> set[str]:
     return {
         name for name, entry in catalog.get("services", {}).items()

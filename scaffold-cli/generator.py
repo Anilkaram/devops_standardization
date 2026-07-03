@@ -1748,6 +1748,52 @@ module "ec2_instance" {
 
 # variables.tf content for each service module (map(object) typed)
 _MODULE_VARS_TF: dict[str, str] = {
+    "autoscaling": '''\
+variable "asg_instance_type" {
+  type        = string
+  description = "EC2 instance type for the Auto Scaling Group."
+  default     = "t3.medium"
+}
+
+variable "asg_root_volume_gb" {
+  type        = number
+  description = "Root EBS volume size in GB."
+  default     = 20
+}
+
+variable "asg_min_size" {
+  type        = number
+  description = "Minimum number of instances in the ASG."
+  default     = 2
+}
+
+variable "asg_max_size" {
+  type        = number
+  description = "Maximum number of instances in the ASG."
+  default     = 6
+}
+
+variable "asg_desired_capacity" {
+  type        = number
+  description = "Desired number of instances in the ASG."
+  default     = 2
+}
+
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+
+variable "cost_centre" {
+  type    = string
+  default = "REPLACE_WITH_COST_CENTRE"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
     "lambda": '''\
 variable "name_prefix" { type = string }
 variable "lambda_s3_bucket" { type = string }

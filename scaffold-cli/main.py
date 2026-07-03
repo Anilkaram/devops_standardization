@@ -195,6 +195,19 @@ def init(
     config = _load_yaml()
     _normalize_services(config)
 
+    # Drop infra-layer names (vpc, iam, security_group) — they are always
+    # auto-generated (networking.tf / iam.tf), never per-service modules.
+    _infra_layers = dg.get_infra_layer_names(catalog)
+    _svcs = config.get("services", [])
+    _dropped = [s for s in _svcs if s in _infra_layers]
+    if _dropped:
+        config["services"] = [s for s in _svcs if s not in _infra_layers]
+        typer.secho(
+            f"  [i] Skipping auto-generated infra layers: {_dropped} "
+            "(VPC/IAM/security groups are always created).",
+            fg=typer.colors.BLUE,
+        )
+
     # ── --describe: AI extraction fills in what infra.yaml doesn't have ───────
     if describe:
         typer.secho(

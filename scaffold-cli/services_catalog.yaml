@@ -89,6 +89,17 @@ services:
       version: "~> 5.0"
     template: null
 
+  # EC2 Auto Scaling Group — launch template + ASG.
+  # category 'scaling' (not 'compute') so it is treated as a regular add-on
+  # module and does not participate in compute-combination validation.
+  autoscaling:
+    category: scaling
+    terraform_resource: aws_autoscaling_group
+    template: iac/compute/autoscaling.tf.j2
+    iam_actions:
+      - autoscaling:Describe*
+      - ec2:DescribeInstances
+
   apprunner:
     category: compute
     terraform_resource: aws_apprunner_service
@@ -150,6 +161,20 @@ services:
       db_engine_version: "16.4"
     iam_actions:
       - rds-db:connect   # scoped to iam_resource_arns.postgres ARN pattern
+
+  # Generic 'rds' alias — defaults to a PostgreSQL engine (most common).
+  # For a specific engine use 'postgres' or 'mysql' directly.
+  rds:
+    category: database
+    registry_module:
+      source: "terraform-aws-modules/rds/aws"
+      version: "~> 7.0"
+    template: iac/data/rds.tf.j2
+    extra_vars:
+      db_engine: postgres
+      db_engine_version: "16.4"
+    iam_actions:
+      - rds-db:connect   # scoped to iam_resource_arns.rds ARN pattern
 
   mysql:
     category: database
@@ -604,6 +629,7 @@ iam_resource_arns:
   bedrock:         ["arn:aws:bedrock:*::foundation-model/*"]
   postgres:        ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
   mysql:           ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
+  rds:             ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
   aurora-postgres: ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
   aurora-mysql:    ["arn:aws:rds-db:{region}:*:dbuser:*/{project}-*"]
   polly:           ["*"]
