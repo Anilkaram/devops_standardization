@@ -32,17 +32,17 @@ resource "aws_launch_template" "app" {
     device_name = "/dev/xvda"
     ebs {
       encrypted             = true
-      kms_key_id            = try(aws_kms_key.main.arn, null)
+      kms_key_id            = var.kms_key_arn
       volume_type           = "gp3"
       volume_size           = var.asg_root_volume_gb
       delete_on_termination = true
     }
   }
 
-  vpc_security_group_ids = [aws_security_group.app.id]
+  vpc_security_group_ids = [var.security_group_id]
 
   iam_instance_profile {
-    name = try(aws_iam_instance_profile.ec2.name, null)
+    name = var.instance_profile_name
   }
 
   monitoring {
@@ -61,7 +61,7 @@ resource "aws_launch_template" "app" {
 
 resource "aws_autoscaling_group" "app" {
   name_prefix         = "{{ project_name }}-${var.environment}-asg-"
-  vpc_zone_identifier = aws_subnet.private[*].id
+  vpc_zone_identifier = var.private_subnet_ids
   min_size            = var.asg_min_size
   max_size            = var.asg_max_size
   desired_capacity    = var.asg_desired_capacity

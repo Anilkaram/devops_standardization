@@ -1,7 +1,7 @@
 # RDS — managed relational database (aws provider ~> 6.0)
 resource "aws_db_subnet_group" "main" {
   name       = "{{ project_name }}-${var.environment}-rds-subnet-grp"
-  subnet_ids = aws_subnet.private[*].id
+  subnet_ids = var.private_subnet_ids
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rds-subnet-grp"
@@ -26,7 +26,7 @@ resource "aws_db_instance" "main" {
   manage_master_user_password = true
 
   db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.app.id]
+  vpc_security_group_ids = [var.security_group_id]
 
   multi_az                = var.multi_az
   backup_retention_period = var.environment == "prod" ? 35 : {{ backup_retention | default(7) }}
@@ -35,7 +35,7 @@ resource "aws_db_instance" "main" {
 
   # Encryption at rest with CMK
   storage_encrypted = true
-  kms_key_id        = try(aws_kms_key.main.arn, null)
+  kms_key_id        = var.kms_key_arn
 
   # Performance Insights — free for db.t3 instances
   performance_insights_enabled          = true

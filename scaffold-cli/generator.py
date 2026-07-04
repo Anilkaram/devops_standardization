@@ -377,7 +377,7 @@ def generate_scaffold(
     # services don't leave orphan files. Keep fixed-name files managed elsewhere.
     _FIXED_TF_FILES = {
         "provider.tf", "networking.tf", "main.tf", "iam.tf",
-        "observability.tf", "output.tf", "variables.tf",
+        "observability.tf", "output.tf", "variables.tf", "security.tf",
     }
     for tf_file in base.glob("*.tf"):
         if tf_file.name not in _FIXED_TF_FILES:
@@ -453,6 +453,12 @@ def generate_scaffold(
     vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
     (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
     typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+
+    # "" security.tf (shared app security group + optional EC2 instance profile) ""
+    # Many modules (alb, ec2, autoscaling, rds, ...) need a shared security group
+    # and EC2 instances need an instance profile. Create them once at root and pass
+    # them into the modules as inputs.
+    _write_shared_glue(base, services, compute_list)
 
     # "" main.tf (compute) " from catalog templates """""""""""""""""""""""""
     compute_templates = []
@@ -644,6 +650,19 @@ def generate_scaffold(
                 dynamic_vars.extend(svc_vars)
                 wrote_any_service = True
 
+        # Inject scalar sizing vars for this service (kms_deletion_window_days etc.)
+        _SCALAR_SVC_VARS: dict[str, list[dict]] = {
+            "kms": [
+                {"name": "kms_deletion_window_days", "type": "number",
+                 "description": "KMS key deletion window in days (7-30)",
+                 "dev": 7, "staging": 14, "prod": 30},
+            ],
+        }
+        if svc in _SCALAR_SVC_VARS:
+            for v in _SCALAR_SVC_VARS[svc]:
+                if not any(d["name"] == v["name"] for d in dynamic_vars):
+                    dynamic_vars.append(v)
+
     # NOTE: KMS is no longer auto-added. The scaffold generates only the services
     # listed in infra.yaml. Module calls that reference an absent module (e.g.
     # try(module.kms.key_arn, null)) are pruned to `null` below, so encryption
@@ -719,6 +738,15 @@ def generate_scaffold(
 # Format: var_name -> (type, description, rhs_in_root_call)
 # rhs_in_root_call is the Terraform expression used in the root main.tf module call.
 _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
+    "alb": [
+        ("environment",            "string",       "var.environment"),
+        ("cost_centre",            "string",       "var.cost_centre"),
+        ("vpc_id",                 "string",       "module.vpc.vpc_id"),
+        ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
+        ("security_group_id",      "string",       "aws_security_group.app.id"),
+        ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
+        ("alb_access_logs_bucket", "string",       "var.alb_access_logs_bucket"),
+    ],
     "lambda": [
         ("name_prefix",          "string",      '"${var.project_name}-${var.environment}"'),
         # Deployment package
@@ -1722,7 +1750,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
 module "ec2_instance" {
   #checkov:skip=CKV_TF_1:Registry source uses semver pin; git commit hash format not supported for Terraform Registry modules
   source  = "terraform-aws-modules/ec2-instance/aws"
-  version = "~> 5.0"
+  version = "~> 6.0"
 
   name          = var.name_prefix
   instance_type = var.instance_type
@@ -1739,18 +1767,17 @@ module "ec2_instance" {
     http_put_response_hop_limit = 1
   }
 
-  # EBS root volume — encrypted with CMK
-  root_block_device = [
-    {
-      encrypted   = true
-      kms_key_id  = var.kms_key_arn
-      volume_type = "gp3"
-      volume_size = var.root_volume_size_gb
-    }
-  ]
+  # EBS root volume — encrypted with CMK (module v6 takes an object, not a list)
+  root_block_device = {
+    encrypted   = true
+    kms_key_id  = var.kms_key_arn
+    volume_type = "gp3"
+    volume_size = var.root_volume_size_gb
+  }
 
-  # IAM instance profile for S3/RDS/Secrets access (created in iam.tf)
-  iam_instance_profile = var.instance_profile_name
+  # IAM instance profile for S3/RDS/Secrets access (created in security.tf)
+  create_iam_instance_profile = false
+  iam_instance_profile        = var.instance_profile_name
 
   # Monitoring
   monitoring = true
@@ -1801,6 +1828,70 @@ variable "environment" {
 variable "cost_centre" {
   type    = string
   default = "REPLACE_WITH_COST_CENTRE"
+}
+
+variable "private_subnet_ids" {
+  type        = list(string)
+  description = "Private subnet IDs the ASG launches instances into."
+}
+
+variable "security_group_id" {
+  type        = string
+  description = "Security group ID attached to ASG instances."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for EBS root volume encryption. null = AWS-managed."
+  default     = null
+}
+
+variable "instance_profile_name" {
+  type        = string
+  description = "IAM instance profile name attached to ASG instances."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+    "rds": '''\
+variable "environment"        { type = string }
+variable "cost_centre"        { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "security_group_id"  { type = string }
+
+variable "multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+    "mysql": '''\
+variable "environment"        { type = string }
+variable "cost_centre"        { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "security_group_id"  { type = string }
+
+variable "multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "kms_key_arn" {
+  type    = string
+  default = null
 }
 
 variable "tags" {
@@ -2594,6 +2685,34 @@ def _service_module_call(svc: str) -> str:
             f'}}\n'
         ),
     }
+    # Database + ASG modules need networking + security group + KMS wired in.
+    _DB_CALL = (
+        f'module "{mod_name}" {{\n'
+        f'  source = "./modules/{mod_name}"\n\n'
+        f'  environment        = var.environment\n'
+        f'  cost_centre        = var.cost_centre\n'
+        f'  multi_az           = var.multi_az\n'
+        f'  private_subnet_ids = module.vpc.private_subnets\n'
+        f'  security_group_id  = aws_security_group.app.id\n'
+        f'  kms_key_arn        = try(module.kms.key_arn, null)\n'
+        f'  tags               = local.common_tags\n'
+        f'}}\n'
+    )
+    if svc in ("rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql"):
+        return _DB_CALL
+    if svc == "autoscaling":
+        return (
+            f'module "autoscaling" {{\n'
+            f'  source = "./modules/autoscaling"\n\n'
+            f'  environment           = var.environment\n'
+            f'  cost_centre           = var.cost_centre\n'
+            f'  private_subnet_ids    = module.vpc.private_subnets\n'
+            f'  security_group_id     = aws_security_group.app.id\n'
+            f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
+            f'  instance_profile_name = aws_iam_instance_profile.ec2.name\n'
+            f'  tags                  = local.common_tags\n'
+            f'}}\n'
+        )
     return _CALLS.get(svc, (
         f'module "{mod_name}" {{\n'
         f'  source = "./modules/{mod_name}"\n\n'
@@ -2699,6 +2818,22 @@ def _write_variables_tf(base: Path, service_vars: list[dict], services: list[str
         lines.append(f'  type        = {var["type"]}')
         lines.append("}")
         lines.append("")
+
+    # Common cross-cutting vars referenced by module calls (multi_az for DBs,
+    # log_retention_days for cloudwatch/lambda). Declared with sensible defaults
+    # so they are valid even if not overridden per-environment.
+    for _name, _type, _default, _desc in [
+        ("multi_az", "bool", "false", "Deploy databases as Multi-AZ (prod recommended)"),
+        ("log_retention_days", "number", "30", "CloudWatch log retention in days"),
+    ]:
+        if _name not in seen:
+            seen.add(_name)
+            lines.append(f'variable "{_name}" {{')
+            lines.append(f'  description = "{_desc}"')
+            lines.append(f'  type        = {_type}')
+            lines.append(f'  default     = {_default}')
+            lines.append("}")
+            lines.append("")
 
     # Scalar service vars (eks, lambda sizing)
     for var in service_vars:
@@ -2924,6 +3059,13 @@ locals {
       retention_in_days = var.log_retention_days
     }
   }
+}
+''')
+    else:
+        # No lambda, but cloudwatch/other modules may still reference this local.
+        blocks.append('''\
+locals {
+  lambda_log_groups = {}
 }
 ''')
 
@@ -3308,6 +3450,102 @@ def _write_secrets_policy(base: Path, project_name: str, data_stores: list) -> N
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 # .gitignore
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
+    """Write security.tf: shared app security group + optional EC2 instance profile.
+
+    These are root-level resources referenced by many modules. The app security
+    group lives in the VPC module's VPC; the EC2 instance profile is only created
+    when an ec2 / autoscaling service is present.
+    """
+    _cat = dg.load_catalog()
+    _bases = {dg._base_svc(s, _cat) or s for s in services}
+    needs_instance_profile = bool({"ec2", "autoscaling"} & _bases)
+
+    # Services that attach to the shared app security group. If none are present
+    # (e.g. a static-site or pure-data stack), don't create the SG — an
+    # unattached security group fails Checkov CKV2_AWS_5.
+    _SG_CONSUMERS = {
+        "alb", "ec2", "autoscaling", "ecs-fargate", "eks",
+        "rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql",
+        "redis", "memcached", "opensearch", "documentdb",
+    }
+    if not (_SG_CONSUMERS & _bases):
+        # Nothing needs the SG/instance profile — remove any stale security.tf
+        # left by a previous run so it doesn't fail CKV2_AWS_5 (unattached SG).
+        _stale = base / "security.tf"
+        if _stale.exists():
+            _stale.unlink()
+        return
+
+    blocks = [
+        "# security.tf — shared app security group + IAM glue (root-level)",
+        "# Referenced by modules (alb, ec2, autoscaling, rds, ...) via their inputs.",
+        "",
+        'resource "aws_security_group" "app" {',
+        '  name_prefix = "${local.name_prefix}-app-"',
+        '  description = "Shared application security group"',
+        "  vpc_id      = module.vpc.vpc_id",
+        "",
+        "  tags = local.common_tags",
+        "",
+        "  lifecycle {",
+        "    create_before_destroy = true",
+        "  }",
+        "}",
+        "",
+        "# HTTPS in from within the VPC (ALB → app). Adjust CIDRs as needed.",
+        'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+        '  security_group_id = aws_security_group.app.id',
+        '  description       = "HTTPS from within the VPC"',
+        "  cidr_ipv4         = var.vpc_cidr",
+        "  from_port         = 443",
+        "  to_port           = 443",
+        '  ip_protocol       = "tcp"',
+        "}",
+        "",
+        'resource "aws_vpc_security_group_egress_rule" "app_all" {',
+        '  security_group_id = aws_security_group.app.id',
+        '  description       = "Allow all outbound"',
+        '  cidr_ipv4         = "0.0.0.0/0"',
+        '  ip_protocol       = "-1"',
+        "}",
+    ]
+
+    if needs_instance_profile:
+        blocks += [
+            "",
+            "# EC2 instance profile — attach app permissions to instances/ASG.",
+            'resource "aws_iam_role" "ec2" {',
+            '  name_prefix        = "${local.name_prefix}-ec2-"',
+            "  assume_role_policy = jsonencode({",
+            '    Version = "2012-10-17"',
+            "    Statement = [{",
+            '      Action    = "sts:AssumeRole"',
+            '      Effect    = "Allow"',
+            '      Principal = { Service = "ec2.amazonaws.com" }',
+            "    }]",
+            "  })",
+            "  tags = local.common_tags",
+            "}",
+            "",
+            '# SSM core access for patching/session-manager (no inbound SSH needed).',
+            'resource "aws_iam_role_policy_attachment" "ec2_ssm" {',
+            "  role       = aws_iam_role.ec2.name",
+            '  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"',
+            "}",
+            "",
+            'resource "aws_iam_instance_profile" "ec2" {',
+            '  name_prefix = "${local.name_prefix}-ec2-"',
+            "  role        = aws_iam_role.ec2.name",
+            "}",
+        ]
+
+    (base / "security.tf").write_text("\n".join(blocks) + "\n", encoding="utf-8")
+    typer.secho("  + security.tf  [app security group"
+                + (" + ec2 instance profile]" if needs_instance_profile else "]"),
+                fg=typer.colors.GREEN)
+
 
 def _write_run_readme(base: Path, project_name: str, env_names: list[str]) -> None:
     """Write README.md + Makefile explaining the per-environment terraform workflow.

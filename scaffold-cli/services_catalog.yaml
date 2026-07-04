@@ -86,7 +86,7 @@ services:
     category: compute
     registry_module:
       source: "terraform-aws-modules/ec2-instance/aws"
-      version: "~> 5.0"
+      version: "~> 6.0"
     template: null
 
   # EC2 Auto Scaling Group — launch template + ASG.
