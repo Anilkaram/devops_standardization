@@ -567,14 +567,27 @@ def _ask_compute(config: dict, dp: Path) -> dict:
             ("ecs-fargate", "Managed containers. No cluster ops. Good for most teams."),
             ("eks",         "Kubernetes. Use when you need advanced scheduling or high ops maturity."),
             ("ec2",         "Full control over VMs. Use only if ECS/EKS don't fit your use case."),
+            ("none",        "No compute here — I'll define it in infra.yaml, or this is a data-only stack."),
         ]
     else:
         options = [
             ("lambda",      "Serverless functions. Pay per invocation. Scales to zero."),
+            ("ec2",         "Virtual machines. Full OS control. Good for stateful or legacy apps."),
             ("ecs-fargate", "Containers with always-on capacity. Use if Lambda limits apply."),
+            ("none",        "No compute here — I'll define it in infra.yaml, or this is a data-only stack."),
         ]
 
     val = _prompt_choice("Which compute service?", options)
+    if val == "none":
+        typer.secho(
+            "    No compute selected. Note: a deployable stack needs a compute "
+            "target — add one to infra.yaml (e.g. ec2, lambda) if you want the "
+            "scaffold to generate compute + a CI/CD pipeline.",
+            fg=typer.colors.YELLOW,
+        )
+        _log_and_echo("services.compute", "none", "interactive prompt",
+                      "User declined a compute target at the prompt.", decisions_path=dp)
+        return config
     config.setdefault("services", []).append(val)
     _log_and_echo("services.compute", val, "interactive prompt",
                   "Primary compute target for this workload.", decisions_path=dp)
