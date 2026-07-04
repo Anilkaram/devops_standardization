@@ -1640,7 +1640,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 
   dimensions = { FunctionName = each.value.name }
 
-  alarm_actions = [var.sns_topic_arn]
+  alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
 }
 
 resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
@@ -1659,7 +1659,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
 
   dimensions = { QueueName = each.value.name }
 
-  alarm_actions = [var.sns_topic_arn]
+  alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
 }
 
 resource "aws_cloudwatch_dashboard" "main" {
@@ -3312,25 +3312,27 @@ sns = {{
             fn_name = f"{project_name}-{env_name}-func"
             q_name  = f"{project_name}-{env_name}-queue"
             d_name  = f"{project_name}-{env_name}-dlq"
-            obj_blocks.append(f'''\
-# CloudWatch alarms
-cloudwatch_alarms = {{
-  lambdas = {{
-    deploy = {{ name = "{fn_name}", threshold = 1, enabled = true }}
-  }}
-  sqs = {{
-    main_queue = {{ name = "{q_name}", threshold = 100, enabled = true }}
-  }}
-  dlq = {{
-    main_dlq = {{ name = "{d_name}", threshold = 1, enabled = true }}
-  }}
-}}
-
-dashboard = {{
-  name = "{project_name}-{env_name}-dashboard"
-  body = {{}}
-}}
-''')
+            # Only emit alarm groups for services that actually exist in the stack,
+            # otherwise the module builds alarms for non-existent lambdas/queues.
+            _lambdas_blk = (
+                f'  lambdas = {{\n    deploy = {{ name = "{fn_name}", threshold = 1, enabled = true }}\n  }}\n'
+                if "lambda" in services else "  lambdas = {}\n"
+            )
+            _sqs_blk = (
+                f'  sqs = {{\n    main_queue = {{ name = "{q_name}", threshold = 100, enabled = true }}\n  }}\n'
+                if "sqs" in services else "  sqs = {}\n"
+            )
+            _dlq_blk = (
+                f'  dlq = {{\n    main_dlq = {{ name = "{d_name}", threshold = 1, enabled = true }}\n  }}\n'
+                if "sqs" in services else "  dlq = {}\n"
+            )
+            obj_blocks.append(
+                "# CloudWatch alarms — only groups for services present in this stack.\n"
+                "cloudwatch_alarms = {\n"
+                + _lambdas_blk + _sqs_blk + _dlq_blk +
+                "}\n\n"
+                f'dashboard = {{\n  name = "{project_name}-{env_name}-dashboard"\n  body = {{}}\n}}\n'
+            )
 
         # Assemble tfvars
         tfvars_lines = [
