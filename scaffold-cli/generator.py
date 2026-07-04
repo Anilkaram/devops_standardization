@@ -644,25 +644,11 @@ def generate_scaffold(
                 dynamic_vars.extend(svc_vars)
                 wrote_any_service = True
 
-    # Auto-add kms module when KMS is needed but not explicitly listed
-    if wrote_any_service and "kms" not in services:
-        kms_entry    = catalog_services.get("kms", {})
-        kms_template = kms_entry.get("template")
-        if kms_template:
-            try:
-                hcl = jinja_env.get_template(kms_template).render(**ctx)
-                _write_service_module(modules_dir, "kms", hcl)
-                service_module_calls.append(_service_module_call("kms"))
-                typer.secho("  + modules/kms/  [auto-added]", fg=typer.colors.GREEN)
-                # The module call references var.kms_deletion_window_days — declare it.
-                if not any(d["name"] == "kms_deletion_window_days" for d in dynamic_vars):
-                    dynamic_vars.append(
-                        {"name": "kms_deletion_window_days", "type": "number",
-                         "description": "KMS key deletion window in days (7-30)",
-                         "dev": 7, "staging": 14, "prod": 30}
-                    )
-            except Exception as e:
-                typer.secho(f"  ! failed kms: {e}", fg=typer.colors.YELLOW)
+    # NOTE: KMS is no longer auto-added. The scaffold generates only the services
+    # listed in infra.yaml. Module calls that reference an absent module (e.g.
+    # try(module.kms.key_arn, null)) are pruned to `null` below, so encryption
+    # falls back to service-managed keys (e.g. S3 SSE-AES256) unless the user
+    # explicitly lists `kms`.
 
     # Append service module calls to root main.tf
     if service_module_calls:
@@ -673,6 +659,11 @@ def generate_scaffold(
             existing.rstrip() + "\n" + separator + "\n".join(service_module_calls),
             encoding="utf-8",
         )
+
+    # Prune references to modules that were never generated, so the stack contains
+    # only what infra.yaml asked for. `try(module.X.attr, null)` -> `null` when X
+    # is absent (Terraform errors on undeclared-module references even inside try()).
+    _prune_absent_module_refs(base / "main.tf", modules_dir)
 
     # "" observability.tf """"""""""""""""""""""""""""""""""""""""""""""""""
     _render(jinja_env, "iac/observability.tf.j2", base / "observability.tf", ctx)
@@ -2423,6 +2414,36 @@ output "api_execution_arn" {
 }
 ''',
 }
+
+
+def _prune_absent_module_refs(main_tf_path: Path, modules_dir: Path) -> None:
+    """Replace references to modules that were never generated with `null`.
+
+    Terraform errors on a reference to an undeclared module even inside try(),
+    so `try(module.kms.key_arn, null)` breaks when no kms module exists. We
+    rewrite such references to `null` for any module not present under modules/.
+    'vpc' is always present (networking.tf), so it is treated as generated.
+    """
+    import re
+    if not main_tf_path.exists():
+        return
+    present = {"vpc"}
+    if modules_dir.exists():
+        present |= {p.name for p in modules_dir.iterdir() if p.is_dir()}
+
+    text = main_tf_path.read_text(encoding="utf-8")
+
+    # try(module.NAME.attr, DEFAULT) -> DEFAULT when NAME is not generated
+    def _repl_try(m: re.Match) -> str:
+        name, default = m.group(1), m.group(2).strip()
+        return default if name not in present else m.group(0)
+
+    text = re.sub(
+        r"try\(\s*module\.(\w+)\.[\w.]+\s*,\s*([^)]+?)\s*\)",
+        _repl_try,
+        text,
+    )
+    main_tf_path.write_text(text, encoding="utf-8")
 
 
 def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") -> None:
