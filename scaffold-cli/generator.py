@@ -232,6 +232,9 @@ def _implicit_connections(services: list, compute_target: str) -> set:
     conns = set()
     if "eventbridge" in s and "sqs" in s:
         conns.add("eventbridge->sqs")
+    if not compute_target:
+        # Compute-less stack (static site / data-only): no compute→store edges.
+        return conns
     if "eventbridge" in s and "sqs" not in s and compute_target == "lambda":
         conns.add("eventbridge->lambda")
     if "sqs" in s and compute_target == "lambda":
@@ -330,8 +333,9 @@ def generate_scaffold(
     env_names    = list(environments.keys()) if environments else ["dev", "staging", "prod"]
 
     # "" Resolve services from catalog """"""""""""""""""""""""""""""""""""""
+    # compute_target may be None for compute-less stacks (static site / data-only).
     compute_list   = dg.resolve_compute_services(services, catalog)
-    compute_target = compute_list[0]
+    compute_target = compute_list[0] if compute_list else None
     compute_set    = set(compute_list)
     other_services = [s for s in services if s not in compute_set]
 

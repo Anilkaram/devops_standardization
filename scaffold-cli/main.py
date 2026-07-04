@@ -273,12 +273,21 @@ def init(
 
     compute = dg.resolve_compute_services(services, catalog)
     if not compute:
+        # A compute-less stack is valid for static sites (S3 + CloudFront) and
+        # data-only stacks — as long as there is at least one real service to build.
+        if not services:
+            typer.secho(
+                f"ERROR: no services to generate.\n"
+                f"  Add a compute target ({', '.join(sorted(compute_services))}) "
+                f"or at least one service (e.g. s3, cloudfront, static-site).",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
         typer.secho(
-            f"ERROR: no compute target found.\n"
-            f"  Add at least one of: {', '.join(sorted(compute_services))}",
-            fg=typer.colors.RED,
+            "  [i] No compute target — generating a compute-less stack "
+            "(static site / data-only). No CI/CD deploy pipeline will be created.",
+            fg=typer.colors.YELLOW,
         )
-        raise typer.Exit(1)
 
     max_compute = dg.get_max_compute_targets(catalog)
     # Count unique base types — ec2-java, ec2-php, ec2-doc all count as one "ec2"
@@ -543,18 +552,26 @@ cicd:
         path.write_text(content, encoding="utf-8")
 
     # ── Full pipeline (replaces simple pipeline.yml from generator) ───────────
-    import pipeline_generator as pg
-    auto_deploy = config.get("cicd", {}).get("auto_deploy", ["dev"])
-    pg.generate_pipeline(
-        project_name  = name,
-        region        = region,
-        compute_list  = compute,
-        services      = services,
-        environments  = environments or {"dev": {}, "staging": {}, "prod": {}},
-        auto_deploy   = auto_deploy,
-        output_path   = INFRA_DIR / "cicd" / "pipeline.yml",
-        use_ai        = True,
-    )
+    # Skip the deploy pipeline for compute-less stacks (static site / data-only):
+    # there is no application to build/deploy, only infrastructure to apply.
+    if compute:
+        import pipeline_generator as pg
+        auto_deploy = config.get("cicd", {}).get("auto_deploy", ["dev"])
+        pg.generate_pipeline(
+            project_name  = name,
+            region        = region,
+            compute_list  = compute,
+            services      = services,
+            environments  = environments or {"dev": {}, "staging": {}, "prod": {}},
+            auto_deploy   = auto_deploy,
+            output_path   = INFRA_DIR / "cicd" / "pipeline.yml",
+            use_ai        = True,
+        )
+    else:
+        typer.secho(
+            "  ~ Skipping CI/CD deploy pipeline (no compute target).",
+            fg=typer.colors.CYAN,
+        )
 
     _write_infra_example(Path("infra.yaml.example"), name)
 
