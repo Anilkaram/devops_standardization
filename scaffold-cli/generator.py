@@ -660,11 +660,6 @@ def generate_scaffold(
             encoding="utf-8",
         )
 
-    # Prune references to modules that were never generated, so the stack contains
-    # only what infra.yaml asked for. `try(module.X.attr, null)` -> `null` when X
-    # is absent (Terraform errors on undeclared-module references even inside try()).
-    _prune_absent_module_refs(base / "main.tf", modules_dir)
-
     # "" observability.tf """"""""""""""""""""""""""""""""""""""""""""""""""
     _render(jinja_env, "iac/observability.tf.j2", base / "observability.tf", ctx)
 
@@ -676,6 +671,13 @@ def generate_scaffold(
 
     # "" locals.tf " cross-module ARN resolution """""""""""""""""""""""""""""
     _write_locals_tf(base, project_name, services, connections)
+
+    # Prune references to modules that were never generated, so the stack contains
+    # only what infra.yaml asked for. `try(module.X.attr, null)` -> `null` when X
+    # is absent (Terraform errors on undeclared-module references even inside try()).
+    # Runs after every root-level .tf file has been written.
+    for _tf in base.glob("*.tf"):
+        _prune_absent_module_refs(_tf, modules_dir)
 
     # "" env/{env}/ " backend.tf, terraform.tfvars, terraform.tfvars.example
     _write_env_files(base, project_name, region, owner, environments or {}, dynamic_vars, services)

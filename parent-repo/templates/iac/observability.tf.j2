@@ -9,20 +9,9 @@ locals {
   }
 }
 
-{% if 'cloudwatch' not in services %}
-# Application log group — used by compute templates via local.log_retention_days
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/app/{{ project_name }}-${var.environment}"
-  retention_in_days = lookup(local.log_retention_days, var.environment, 30)
-  kms_key_id        = try(aws_kms_key.main.arn, null)
-
-  tags = {
-    Name        = "{{ project_name }}-${var.environment}-app-logs"
-    Environment = var.environment
-    CostCentre  = var.cost_centre
-  }
-}
-{% endif %}
+{# Each compute module (lambda, ecs, ec2) creates and encrypts its own log
+   group. The former generic "/app/" log group was unreferenced dead
+   infrastructure, so it is intentionally not generated here. #}
 
 {% if 'cloudwatch' not in services and 'lambda' in compute_target %}
 # Lambda error-rate alarm

@@ -37,7 +37,7 @@ output "ecs_service_name" {
   value       = module.ecs.service_name
 }
 {% endif %}
-{% if 'kms' in data_stores or data_stores %}
+{% if 'kms' in services %}
 output "kms_key_id" {
   description = "KMS CMK key ID"
   value       = try(module.kms.key_id, null)
