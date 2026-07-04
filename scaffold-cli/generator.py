@@ -2552,11 +2552,16 @@ def _prune_absent_module_refs(main_tf_path: Path, modules_dir: Path) -> None:
     main_tf_path.write_text(text, encoding="utf-8")
 
 
-def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") -> None:
+def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -> None:
     """
-    Write modules/<svc>/{main.tf, variables.tf, outputs.tf} using the
-    map(object) + for_each pattern matching terraform_templates reference.
-    The Jinja2-rendered HCL is replaced by static, reusable module templates.
+    Write modules/<svc>/{main.tf, variables.tf, outputs.tf}.
+
+    main.tf priority:
+      1. A hardened static template in _MODULE_MAIN_HCL (guaranteed Checkov-clean),
+      2. else the Jinja2-rendered HCL passed in by the caller (rendered_hcl),
+      3. else a TODO placeholder.
+    This lets services like rds/autoscaling use their rendered template while
+    kms/s3/secrets-manager/cloudwatch keep their hardened static versions.
     """
     mod_name = svc.replace("-", "_")
     mod_dir  = modules_dir / mod_name
@@ -2582,7 +2587,11 @@ def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") ->
         '  default = {}\n'
         '}\n'
     )
-    main_hcl   = _MODULE_MAIN_HCL.get(svc, f'# TODO: add {svc} resources here\n')
+    main_hcl   = (
+        _MODULE_MAIN_HCL.get(svc)                       # 1. hardened static
+        or (rendered_hcl if rendered_hcl.strip() else None)  # 2. Jinja render
+        or f'# TODO: add {svc} resources here\n'        # 3. placeholder
+    )
     vars_hcl   = _MODULE_VARS_TF.get(svc, _TAGS_VAR_FALLBACK)
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
