@@ -333,9 +333,10 @@ def generate_scaffold(
     env_names    = list(environments.keys()) if environments else ["dev", "staging", "prod"]
 
     # "" Resolve services from catalog """"""""""""""""""""""""""""""""""""""
-    # compute_target may be None for compute-less stacks (static site / data-only).
+    # compute_target is "" (empty) for compute-less stacks (static site / data-only).
+    # Empty string keeps Jinja `'x' in compute_target` checks safe (unlike None).
     compute_list   = dg.resolve_compute_services(services, catalog)
-    compute_target = compute_list[0] if compute_list else None
+    compute_target = compute_list[0] if compute_list else ""
     compute_set    = set(compute_list)
     other_services = [s for s in services if s not in compute_set]
 
@@ -483,12 +484,15 @@ def generate_scaffold(
                 rendered_hcl[c] = hcl
                 dynamic_vars.extend(svc_vars)
 
-    # Append ingress add-ons that apply to the current compute targets
+    # Append ingress add-ons that apply to the current targets.
+    # valid_compute_targets may include non-compute backends (s3, static-site) —
+    # e.g. CloudFront can front an S3 bucket with no compute at all. So match
+    # against ALL services, not just compute_list.
     for ingress_svc, i_entry in ingress_svcs.items():
         if ingress_svc not in services:
             continue
         allowed = set(i_entry.get("valid_compute_targets", []))
-        if not any(c in allowed for c in compute_list):
+        if not (allowed & set(services)):
             continue
         i_template = i_entry.get("template")
         if i_template:
