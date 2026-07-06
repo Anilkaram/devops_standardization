@@ -1,327 +1,225 @@
 # DevOps Standardization Tool
-**AWS Infrastructure Scaffold Generator — v2**
 
-A conversational CLI that generates production-ready Terraform IaC and GitHub Actions pipelines from a minimal `infra.yaml` descriptor. Every service is a reusable Terraform module. Adding a new resource (queue, secret, Lambda function) requires editing only `terraform.tfvars` — no Terraform code changes needed.
+**AWS Infrastructure Scaffold Generator**
+
+One `infra.yaml` in → a complete, security-hardened, multi-environment Terraform workspace out. Every service becomes a reusable module, every environment gets its own tfvars, and the output ships pre-validated: `terraform validate` clean and **Checkov security score 100%** out of the box.
+
+```
+infra.yaml (15–100 lines)  ──►  scaffold init  ──►  .infra/ (40+ AWS resources, plan-ready)
+```
 
 ---
 
-## What's New in v2
+## Why this tool — the DevOps adoption case
 
-| Area | v1 | v2 |
-|---|---|---|
-| **Service layout** | Flat `.tf` files at root (`sqs.tf`, `sns.tf`) | Every service → `modules/<svc>/{main.tf, variables.tf, outputs.tf}` |
-| **Module variables** | Flat scalars (`sqs_visibility_timeout = 60`) | `map(object)` typed variables (`sqs_queues = { main = {...} }`) |
-| **Adding resources** | Edit module HCL + variables + tfvars | **Edit tfvars only** — no code change |
-| **`for_each`** | Single hardcoded resource per module | `for_each = var.sqs_queues` handles any number dynamically |
-| **`locals.tf`** | Not generated | Generated — resolves `lambda_key → ARN`, builds log groups, alarm targets |
-| **CLI naming preview** | Not shown | Naming pattern + 10 resource examples printed after project name entry |
-| **Owner/env validation** | None | Validates format on input (lowercase, hyphens, max length) |
-| **`infra.yaml.example`** | Not generated | Generated on every `init` run with full field reference |
-| **Scaffold guide** | Not included | `scaffold_guide.docx` — 10-section guide, infra.yaml → Terraform walkthrough |
+| Pain today | With the scaffold tool |
+|---|---|
+| Every team writes Terraform differently — no naming, tagging, or layout standard | One generator = one standard. Same module layout, `<project>-<env>-<resource>` naming, and mandatory tags on every stack |
+| Security hardening is an afterthought — Checkov/tfsec findings pile up before release | Templates are pre-hardened: KMS encryption, IMDSv2, private subnets, least-privilege IAM. **Checkov passes from the first generate** |
+| Weeks to bootstrap a new service's infra | Minutes: write `infra.yaml`, run `scaffold init`, fill a short checklist of real-world values (cert ARN, state bucket) |
+| Dev/prod drift — hand-copied `.tf` files diverge | Same modules for every env; **only `env/<env>/terraform.tfvars` differs** (sizing, multi-AZ, retention) |
+| Secrets accidentally committed in tfvars | Built-in secret scan flags plaintext credentials (even inside the `secrets` map) with file + line, and fails the gate |
+| "Is this stack safe to apply?" is a manual review | `scaffold validate` — one command, four gates, CI-ready exit code |
+| Regenerating wipes manual customizations | Idempotent re-init: a hash manifest detects your edits and **preserves them** (override with `--force`) |
+| Adding a queue/bucket/secret means touching module code | `map(object)` + `for_each` pattern: **add resources by editing tfvars only** |
 
 ---
 
-## Quick Start
-
-### 1. Install dependencies
+## Quick start
 
 ```bash
-cd devops-scaffold-workspace/scaffold-cli
-pip install -r requirements.txt
+# Install (editable — one time, from the workspace root)
+pip install -e .
+
+# 1. Write infra.yaml (see "Writing infra.yaml" below), then:
+scaffold init            # interactive — prompts for anything missing
+scaffold init --yes      # non-interactive — use infra.yaml + defaults
+scaffold init --describe "Python Lambda behind API Gateway with SQS and KMS"   # AI extracts config
+
+# 2. Health-check and fill in real-world values
+scaffold doctor          # lists every unfilled placeholder with plain-English hints
+
+# 3. Create the remote-state backend (once per project)
+scaffold init-backend    # S3 state bucket + DynamoDB lock table
+
+# 4. Quality gate — run any time, wire into CI
+scaffold validate        # terraform validate + Checkov + secret scan + placeholder check
+scaffold validate --plan # additionally runs terraform plan (needs AWS credentials)
+
+# 5. Deploy
+cd .infra
+terraform init
+terraform plan  -var-file=env/dev/terraform.tfvars
+terraform apply -var-file=env/dev/terraform.tfvars
 ```
 
-### 2. Set your AI provider key (optional)
+## Command reference
 
-AI is only used when a service has no catalog template (unknown service) or when using `--describe`. All standard services use predefined Jinja2 templates.
+| Command | What it does |
+|---|---|
+| `scaffold init` | Generate the full Terraform workspace from `infra.yaml`. Ends with a **NEXT STEPS checklist** of values you must fill. Re-running preserves files you edited (`--force` to overwrite; `--dry-run` to preview) |
+| `scaffold doctor` | Diagnose the scaffold: required tools present, unfilled `REPLACE_WITH_*` placeholders (with file:line + what each value means), plaintext-secret scan, list of user-modified files. Exit 1 if anything needs fixing |
+| `scaffold validate` | The quality gate. Four checks, one scorecard: **terraform validate**, **Checkov security scan** (with % score), **tfvars secret scan**, **placeholder check**. `--plan` adds a real `terraform plan`. Non-zero exit on any failure → drop it straight into CI |
+| `scaffold init-backend` | Bootstrap the S3 state bucket + DynamoDB lock table (run once), then patch `backend.tf` |
+| `scaffold services` | List the service catalog by category, showing which are static-template vs AI-generated |
+| `scaffold providers` | Show the configured AI provider/model (AI is only used for `--describe` and non-catalog services) |
 
-```bash
-# Claude (default)
-set ANTHROPIC_API_KEY=sk-ant-...
+---
 
-# Or OpenAI
-set AI_PROVIDER=openai
-set OPENAI_API_KEY=sk-...
+## How the Terraform is generated
 
-# Or Gemini
-set AI_PROVIDER=gemini
-set GOOGLE_API_KEY=AIza...
+The generator walks three layers for every service in `infra.yaml`:
+
+```
+infra.yaml
+   │
+   ▼
+┌───────────────────────────────────────────────────────────────┐
+│ 1. Service catalog lookup (services_catalog.yaml)             │
+│    static Jinja2 template?  → render it (hardened HCL)        │
+│    no template?             → AI generates the module         │
+├───────────────────────────────────────────────────────────────┤
+│ 2. Module assembly   modules/<svc>/                           │
+│    main.tf       the resources (reads var.* only)             │
+│    variables.tf  declarations — auto-completed: every var.*   │
+│                  the module uses is guaranteed declared       │
+│    outputs.tf    ARNs/names re-exported for cross-wiring      │
+├───────────────────────────────────────────────────────────────┤
+│ 3. Root wiring       .infra/main.tf                           │
+│    module "rds" { … } blocks connect each module to           │
+│    VPC subnets, the shared security group, KMS, and root vars │
+└───────────────────────────────────────────────────────────────┘
+   │
+   ▼
+env/<env>/terraform.tfvars   ← the ONLY per-environment file
 ```
 
-### 3. Run the tool
+Key design rules:
 
-```bash
-# Option A: Interactive — answer prompts, naming preview shown after project name
-python scaffold-cli/main.py init
+- **Modules never hardcode environment values.** They read variables; the root `main.tf` wires those variables to other modules' outputs (`module.vpc.private_subnets`, `module.kms.key_arn`) and to root variables.
+- **Values live in tfvars.** `environments:` in infra.yaml becomes `env/dev|uat|prod/terraform.tfvars`. Dev and prod deploy **identical code** — only the tfvars differ (`multi_az`, node counts, retention...).
+- **tfvars only contains real knobs.** Services that size themselves from the environment name (RDS instance class, backup retention) get no tfvars entry — that's intentional, not missing.
+- **`map(object)` + `for_each` everywhere it fits.** Adding a second queue or secret = adding a map entry in tfvars. No module code changes, ever.
+- **Cross-cutting infra is always generated**: VPC + subnets (`networking.tf`), IAM roles (`iam.tf`), shared security group (`security.tf`), tagging (`provider.tf` → `local.common_tags`), plus a GitHub Actions pipeline (`cicd/pipeline.yml`) and a cost estimate (`cost-estimate.md`).
 
-# Option B: Full infra.yaml already filled — skips all prompts
-python scaffold-cli/main.py init --yes
-
-# Option C: Describe your architecture in plain English (AI extracts config)
-python scaffold-cli/main.py init --describe "Python Lambda on EKS with SQS, KMS, Secrets Manager"
-
-# Option D: Dry run — preview files without writing
-python scaffold-cli/main.py init --dry-run
-```
-
-### 4. Review output
+### Generated layout
 
 ```
 .infra/
-├── provider.tf              # AWS provider + Terraform version + common_tags local
-├── main.tf                  # Root module calls — one block per service
-├── networking.tf            # VPC, subnets, security groups
-├── iam.tf                   # IAM roles and policies
-├── locals.tf                # Cross-module ARN resolution, lambda_configs defaults
-├── observability.tf         # CloudWatch log groups + alarms (when cloudwatch not in services)
-├── output.tf                # Terraform outputs (URLs, ARNs, cluster names)
-├── variables.tf             # Variable declarations — scalars + map(object) typed
-├── modules/
-│   ├── lambda/              # Lambda function (for_each over lambda_configs)
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── eks/                 # EKS cluster + node group
-│   ├── sqs/                 # SQS queues + DLQs (for_each over sqs_queues)
-│   ├── sns/                 # SNS topic + subscriptions
-│   ├── kms/                 # KMS key + alias
-│   ├── ecr/                 # ECR repositories (for_each over ecr_repositories)
-│   ├── eventbridge/         # EventBridge Scheduler + ECR push rule
-│   ├── secrets_manager/     # Secrets Manager secrets (for_each over secrets)
-│   └── cloudwatch/          # Log groups, alarms, dashboard (for_each)
-├── env/
-│   ├── uat/
-│   │   ├── backend.tf               # S3 remote state for uat
-│   │   ├── terraform.tfvars         # All values: scalars + map objects
-│   │   └── terraform.tfvars.example
-│   └── prod/  (same structure)
-├── cicd/
-│   ├── pipeline.yml         # GitHub Actions multi-stage pipeline
-│   └── README.md
-├── secrets/
-│   └── secrets-policy.yml
-└── decisions.md             # Architecture Decision Record
+├── provider.tf          # AWS provider, versions, common_tags
+├── main.tf              # root module calls — one block per service
+├── networking.tf        # VPC, public/private subnets, NAT
+├── security.tf          # shared app security group
+├── iam.tf               # roles + least-privilege policies
+├── locals.tf            # cross-module ARN resolution
+├── variables.tf         # root declarations (no values)
+├── modules/<svc>/       # main.tf / variables.tf / outputs.tf per service
+├── env/<env>/           # backend.tf + terraform.tfvars per environment
+├── cicd/pipeline.yml    # GitHub Actions: validate → plan → apply per env
+├── cost-estimate.md     # monthly cost projection
+├── checkov-report.txt   # security scan report
+└── decisions.md         # audit log of every generation decision
 ```
 
 ---
 
-## How It Works
+## Writing infra.yaml — from an architecture diagram
 
-```
-infra.yaml  ──────────────────────────────────────────────────────────────┐
-                                                                          │
-  --describe flag ──> AI extracts config from free-text description       │
-                                                                          │
-  Interactive prompts (only for missing fields)                           │
-    - Project name → shows naming convention preview                      │
-    - Owner (validated: lowercase + hyphens, max 30 chars)                │
-    - Environments (validated: lowercase + hyphens, max 10 chars)         │
-                                                                          │
-  Catalog lookup ──> Jinja2 template per known service                    │
-                └──> AI fallback for unknown services [ai-generated]      │
-                                                                          │
-  Module generation:                                                       │
-    Each service → modules/<svc>/main.tf       (for_each resources)       │
-                   modules/<svc>/variables.tf  (map(object) typed)        │
-                   modules/<svc>/outputs.tf    (map-keyed outputs)        │
-                                                                          │
-  locals.tf ──> resolves lambda_key → ARN, builds log groups              │
-                                                                          │
-  env/{env}/terraform.tfvars ──> structured map objects per service       │
-                                                                          │
-  .infra/ scaffold + cicd/pipeline.yml + decisions.md + infra.yaml.example│
+When you have an architecture image (draw.io, Lucidchart, a whiteboard photo) plus requirement notes, translate it section by section. **Rule of thumb: every box in the diagram is a `services:` entry; every arrow is a `connections:` entry.**
+
+### 1. `project` — the title block of your diagram
+```yaml
+project:
+  name: newton-platform        # lowercase + hyphens, max 20 chars — prefixes every resource
+  region: us-east-1
+  owner: platform-team         # becomes the Owner tag on all resources
 ```
 
-### Variable flow
+### 2. `services` — one entry per box in the image
+Walk the diagram edge-to-core and list what you see (`scaffold services` shows all valid names):
 
+```yaml
+services:
+  - cloudfront          # the CDN box at the edge
+  - waf                 # the shield icon in front of everything
+  - s3                  # the static-assets bucket
+  - api-gateway         # the API entry point
+  - lambda              # serverless compute box
+  - eks                 # the Kubernetes cluster box
+  - ecr                 # container registry
+  - kms                 # the key icon — encryption at rest
+  - secrets-manager     # credentials store
+  - cloudwatch          # the monitoring box
 ```
-infra.yaml environments  →  env/{env}/terraform.tfvars  →  root variables.tf
-   (node_count, timeout)         (map objects + scalars)      (no defaults)
-                                         │
-                                   locals.tf
-                               (resolves ARNs)
-                                         │
-                              root main.tf module calls
-                            (pass whole maps to modules)
-                                         │
-                              modules/<svc>/variables.tf
-                             (map(object) typed inputs)
-                                         │
-                              modules/<svc>/main.tf
-                             (for_each = var.sqs_queues)
-```
+Don't list VPC, subnets, IAM, or security groups — the networking/IAM layer is **always generated automatically**.
 
-### Adding a new SQS queue (example)
-
-Edit `env/uat/terraform.tfvars` only — no Terraform code change:
-
-```hcl
-sqs_queues = {
-  main_queue = { ... }          # existing
-  new_queue  = {                # add this block
-    name                       = "my-project-uat-new"
-    message_retention_seconds  = 345600
-    max_message_size           = 1048576
-    visibility_timeout_seconds = 60
-    dlq_key                    = "new_dlq"
-  }
-}
-
-dlq_queues = {
-  main_dlq = { ... }
-  new_dlq  = {
-    name                      = "my-project-uat-new-dlq"
-    message_retention_seconds = 1209600
-  }
-}
+### 3. `connections` — one entry per arrow
+These document the data flow and drive IAM/wiring decisions:
+```yaml
+connections:
+  - { from: cloudfront,  to: s3     }   # CDN serves static files from bucket
+  - { from: api-gateway, to: lambda }   # API calls invoke Lambda
+  - { from: ecr,         to: eks    }   # cluster pulls images
+  - { from: kms,         to: s3     }   # encryption edges from the key icon
 ```
 
-Same pattern applies to Lambda functions (`lambda_configs`), ECR repos (`ecr_repositories`), Secrets (`secrets`), EventBridge schedules (`eventbridge_schedules`), and CloudWatch alarms.
+### 4. `environments` — the sizing table from your requirements
+Any per-env numbers in the requirement doc (instance sizes, node counts, HA) go here — they become each env's `terraform.tfvars`:
+```yaml
+environments:
+  uat:
+    multi_az: true
+    eks:    { node_count: 2, instance_type: t3.xlarge }
+    lambda: { memory_mb: 512, timeout_s: 30 }
+  prod:
+    multi_az: true
+    eks:    { node_count: 3, instance_type: t3.2xlarge }
+    lambda: { memory_mb: 1024, timeout_s: 30 }
+```
+
+### 5. `auth`, `flows`, `cicd` — the annotations
+```yaml
+auth:
+  required: true
+  method: iam            # or cognito for user-facing JWT auth
+
+flows:                   # optional but valuable: narrate the numbered arrows
+  user_request_flow:
+    description: "Client → WAF → CloudFront/S3 for static, API Gateway → Lambda → EKS for dynamic."
+    services: [cloudfront, s3, api-gateway, lambda, eks]
+
+cicd:
+  auto_deploy:   [dev]
+  manual_deploy: [uat, prod]   # approval gate before promotion
+```
+
+**Shortcut:** paste the diagram description into `scaffold init --describe "..."` and the AI drafts the infra.yaml for you; review it, then re-run `init --yes`.
+
+After generation, `infra.yaml.example` is written next to your file with the complete field reference.
 
 ---
 
-## Naming Convention
+## Built-in guardrails
 
-Pattern: `{project_name}-{environment}-{resource-suffix}`
+- **Security-hardened templates** — encryption at rest (KMS/SSE), IMDSv2, private subnets for data services, log retention, WAF managed rules. Verified by the bundled Checkov scan on every `init`.
+- **Secret scan** — plaintext credentials in any tfvars (including `value = "..."` inside the `secrets` map) are reported with file + line and fail `doctor`/`validate`. Remediation guidance included (`aws secretsmanager put-secret-value` post-apply).
+- **Placeholder discipline** — values only you can know (ACM cert ARN, state bucket, AMI ID) are generated as `REPLACE_WITH_*` and tracked until you fill them.
+- **Idempotent regeneration** — `.infra/.scaffold-manifest.json` fingerprints every generated file; re-running `init` after you customized a module keeps your changes.
+- **Decision audit** — every choice (from prompt, yaml, or AI) is logged to `.infra/decisions.md` for review.
+- **Coverage-tested generator** — the test suite generates every catalog service and asserts each module contains real resources and is wired from root (`scaffold-cli/tests/`).
 
-| Resource | Example |
-|---|---|
-| Lambda function | `my-api-uat-func` |
-| Lambda IAM role | `my-api-uat-lambda-role` |
-| EKS cluster | `my-api-uat-cluster` |
-| SQS queue | `my-api-uat-queue` |
-| SQS DLQ | `my-api-uat-dlq` |
-| ECR repository | `my-api-uat-app` |
-| KMS alias | `alias/my-api-uat` |
-| Secrets Manager | `my-api/uat/app` (slash-separated) |
-| CloudWatch log group | `/aws/lambda/my-api-uat-func` |
-| SNS topic | `my-api-uat-notifications` |
+## Requirements
 
-The CLI prints a live preview of these names immediately after the project name is entered.
+- Python ≥ 3.10, Terraform ≥ 1.5, Checkov (`pip install checkov`) for the security gate
+- An AI provider key only if you use `--describe` or non-catalog services (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY`)
 
----
-
-## Supported Services
-
-| Category | Services |
-|---|---|
-| Compute | `lambda`, `eks`, `ecs-fargate`, `ec2` |
-| Messaging | `sqs`, `sns`, `eventbridge` |
-| Storage | `s3`, `dynamodb`, `rds`, `aurora`, `redis` |
-| Security | `kms`, `secrets-manager`, `cognito` |
-| DevOps | `ecr`, `api-gateway` |
-| Observability | `cloudwatch` |
-
-Run `python scaffold-cli/main.py services` to list all services and their catalog status.
-
----
-
-## Reusing Modules Across Projects
-
-Every module is self-contained. To reuse `modules/sqs` in another project, change the source in that project's `main.tf`:
-
-```hcl
-# From local path
-module "sqs" {
-  source = "./modules/sqs"
-  ...
-}
-
-# To Git URL (shared across projects)
-module "sqs" {
-  source = "git::https://github.com/your-org/infra-modules.git//sqs?ref=v1.0"
-  ...
-}
-```
-
----
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `python scaffold-cli/main.py init` | Generate scaffold (interactive) |
-| `python scaffold-cli/main.py init --yes` | Skip prompts, use infra.yaml as-is |
-| `python scaffold-cli/main.py init --dry-run` | Preview files without writing |
-| `python scaffold-cli/main.py init --describe "..."` | AI extracts config from text |
-| `python scaffold-cli/main.py services` | List all supported services |
-| `python scaffold-cli/main.py providers` | Show AI provider status |
-
----
-
-## Applying the Terraform
-
-```bash
-cd .infra
-
-# Initialize for an environment
-terraform init -backend-config=env/uat/backend.tf
-
-# Plan
-terraform plan -var-file=env/uat/terraform.tfvars
-
-# Apply
-terraform apply -var-file=env/uat/terraform.tfvars
-```
-
----
-
-## Repository Layout
+## Repository layout
 
 ```
 devops-scaffold-workspace/
-├── scaffold-cli/
-│   ├── main.py                # CLI entry point, infra.yaml.example writer
-│   ├── generator.py           # Scaffold writer — modules, variables, locals, tfvars
-│   ├── dynamic_generator.py   # AI-powered generator for unknown services
-│   ├── pipeline_generator.py  # GitHub Actions pipeline builder
-│   ├── interactive_prompts.py # CLI prompts with naming preview + validators
-│   ├── config_extractor.py    # --describe AI extraction
-│   ├── ai_client.py           # Claude / OpenAI / Gemini abstraction
-│   ├── decisions.py           # decisions.md writer
-│   ├── services_catalog.yaml  # Source of truth for 50+ AWS services
-│   └── requirements.txt
-├── parent-repo/
-│   └── templates/             # Jinja2 Terraform templates (iac/, cicd/, iam/)
-├── terraform_templates/       # Reference implementation (bakker production project)
-│   ├── modules/               # Reusable modules: lambda, sqs, sns, iam, ecr, etc.
-│   └── env/                   # uat + prod tfvars with full map(object) configs
-├── scaffold_guide.docx        # 10-section guide: infra.yaml → Terraform walkthrough
-└── testing-ground/            # Live test project (eks-cicd-platform infra.yaml)
-    └── .infra/                # Generated output — inspect to verify scaffold
+├── scaffold-cli/        # the generator CLI (main.py, generator.py, catalog, tests)
+├── parent-repo/         # Jinja2 templates (iac/, cicd/) — the standardization source of truth
+├── testing-ground/      # sandbox: sample infra.yaml + generated .infra/
+├── pyproject.toml       # pip install -e . → `scaffold` command
+└── APPLICATION_GUIDE.md # deep-dive walkthrough
 ```
-
----
-
-## infra.yaml Quick Reference
-
-Minimal:
-
-```yaml
-project:
-  name: my-api
-  region: us-east-1
-  owner: platform-team
-
-services:
-  - lambda
-  - sqs
-  - kms
-
-environments:
-  dev: {}
-  prod: {}
-```
-
-Full example with all options: run `python scaffold-cli/main.py init --yes` and inspect `infra.yaml.example`.
-
----
-
-## Known Terraform Errors and Fixes
-
-| Error | Cause | Fix |
-|---|---|---|
-| Duplicate `aws_cloudwatch_log_group` | Both `observability.tf` and `cloudwatch.tf` define it | Guard in `observability.tf.j2` with `{% if 'cloudwatch' not in services %}` |
-| `dev =` invalid expression | `log_retention_days` was a scalar, template expected dict | Coerce scalar to `{dev, staging, prod}` dict in generator |
-| `Single quotes are not valid` in `cloudwatch.tf` | Python dict rendered directly into HCL | Use `lookup(local.log_retention_days, var.environment, 30)` |
-
-Rule: never render a Python `dict` or `list` directly into HCL via `{{ variable }}`. Always emit a scalar or use a Terraform `lookup()`/`tomap()` expression.
