@@ -178,6 +178,10 @@ def init(
         None, "--ai-model",
         help="Override AI_MODEL env var for the selected provider",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Overwrite files you edited since the last generation (default: preserve them)",
+    ),
 ):
     """Generate Terraform infrastructure scaffold from infra.yaml."""
     import os
@@ -400,10 +404,40 @@ def init(
         dec.log_decision("cloud.provider", config["cloud"]["provider"],
                          "infra.yaml", "Read from project config file.", path=decisions_path)
 
+    # ── Preserve user edits across re-generation ─────────────────────────────
+    user_edits = {} if force else _detect_user_edits(INFRA_DIR)
+    if user_edits:
+        typer.secho(
+            f"  [i] {len(user_edits)} file(s) modified since last generation — "
+            "your edits will be preserved (use --force to regenerate them):",
+            fg=typer.colors.BLUE,
+        )
+        for rel in list(user_edits)[:10]:
+            typer.echo(f"      {rel}")
+
     # ── Generate ──────────────────────────────────────────────────────────────
     typer.secho("\n> Generating scaffold...", fg=typer.colors.BLUE, bold=True)
     import generator
-    generator.generate_scaffold(config, catalog)
+    try:
+        generator.generate_scaffold(config, catalog)
+    except Exception as exc:
+        import traceback
+        INFRA_DIR.mkdir(exist_ok=True)
+        (INFRA_DIR / "generation-error.log").write_text(traceback.format_exc(), encoding="utf-8")
+        typer.secho(
+            f"\nERROR: generation failed — {type(exc).__name__}: {exc}\n"
+            f"  Full traceback saved to {INFRA_DIR / 'generation-error.log'}\n"
+            f"  Common causes: malformed infra.yaml (run with no infra.yaml to use prompts),\n"
+            f"  or an unsupported service combination — run 'services' to see the catalog.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    # Restore the user's edits on top of the fresh generation.
+    for rel, content in user_edits.items():
+        (INFRA_DIR / rel).write_bytes(content)
+    if user_edits:
+        typer.secho(f"  [OK] Restored {len(user_edits)} user-edited file(s).", fg=typer.colors.GREEN)
 
     # ── Write infra.yaml.example with naming conventions ─────────────────────
     def _write_infra_example(path: Path, project_name: str) -> None:
@@ -596,21 +630,19 @@ cicd:
         typer.secho(f"  Quality report : {checkov_report.absolute()}", fg=typer.colors.CYAN)
 
     typer.echo(f"  Example        : infra.yaml.example  (naming conventions + field reference)")
-    typer.secho(
-        "\n  Next step: run 'python scaffold-cli/main.py init-backend' to create the S3 state bucket.",
-        fg=typer.colors.CYAN,
-    )
+
+    # Manifest covers everything generated this run (incl. pipeline/cost files).
+    # User-edited files keep their previous generated hash so they stay
+    # recognized as user-modified on the next re-init.
+    _save_manifest(INFRA_DIR, preserve_hashes={
+        rel: h for rel, h in _load_manifest(INFRA_DIR).get("files", {}).items() if rel in user_edits
+    } if user_edits else {})
+    _print_next_steps(INFRA_DIR)
 
 
-def _run_checkov_score(infra_dir: Path) -> None:
-    """
-    Run Checkov on the generated .infra/ directory and print a quality score.
-    Shows passed/failed counts + percentage with colour coding.
-    Silently skips if checkov is not installed (prints install hint instead).
-    """
-    import subprocess, re as _re, shutil, sys
-
-    typer.secho("\n> Checkov quality scan...", fg=typer.colors.BLUE, bold=True)
+def _resolve_checkov_cmd() -> list:
+    """Locate a runnable checkov, or [] if unavailable."""
+    import subprocess, shutil, sys
 
     # Resolve checkov command — four strategies tried in order:
     #   1. python -m checkov      (current interpreter, works when venv is active)
@@ -671,6 +703,20 @@ def _run_checkov_score(infra_dir: Path) -> None:
         if _binary and _probe([_binary]):
             _checkov_cmd = [_binary]
 
+    return _checkov_cmd
+
+
+def _run_checkov_score(infra_dir: Path) -> None:
+    """
+    Run Checkov on the generated .infra/ directory and print a quality score.
+    Shows passed/failed counts + percentage with colour coding.
+    Silently skips if checkov is not installed (prints install hint instead).
+    """
+    import subprocess, re as _re
+
+    typer.secho("\n> Checkov quality scan...", fg=typer.colors.BLUE, bold=True)
+
+    _checkov_cmd = _resolve_checkov_cmd()
     if not _checkov_cmd:
         typer.secho(
             "  [!] Checkov not found — install it inside your venv:\n"
@@ -795,6 +841,248 @@ def _scan_tfvars_for_secrets(infra_dir: Path) -> None:
             typer.secho(f"  {path}: {snippet}...", fg=typer.colors.RED)
     else:
         typer.secho("  [OK] Secret scan: no plaintext secrets detected in tfvars.", fg=typer.colors.GREEN)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Placeholder scan / next-steps / doctor / validate / manifest
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PLACEHOLDER_HINTS = {
+    "REPLACE_WITH_STATE_BUCKET":   "S3 bucket for Terraform state — create it with: python scaffold-cli/main.py init-backend",
+    "REPLACE_WITH_LOCK_TABLE":     "DynamoDB table for state locking — created by init-backend too",
+    "REPLACE_WITH_ACM_CERT_ARN":   "ACM certificate ARN for the ALB HTTPS listener (AWS Console > Certificate Manager)",
+    "REPLACE_WITH_ALB_LOG_BUCKET": "S3 bucket that receives ALB access logs",
+    "REPLACE_WITH_LOG_BUCKET":     "S3 bucket that receives ALB access logs",
+    "REPLACE_WITH_COST_CENTRE":    "your team/department cost-centre tag for billing reports",
+    "REPLACE_WITH_AMI_ID":         "AMI ID for the EC2/autoscaling instances (e.g. latest Amazon Linux 2023 in your region)",
+}
+
+_MANIFEST_NAME = ".scaffold-manifest.json"
+_MANIFEST_SKIP = {".terraform", ".terraform.lock.hcl", "checkov-report.txt", _MANIFEST_NAME, "generation-error.log", "decisions.md"}
+
+
+def _scan_placeholders(infra_dir: Path) -> list[tuple[Path, int, str]]:
+    """Find unfilled REPLACE_WITH_* placeholders in generated files."""
+    import re as _re
+    found = []
+    for f in sorted(infra_dir.rglob("*")):
+        if not f.is_file() or f.suffix not in {".tf", ".tfvars", ".yml", ".yaml", ".json"}:
+            continue
+        if any(part in _MANIFEST_SKIP for part in f.parts):
+            continue
+        try:
+            for i, line in enumerate(f.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                for m in _re.finditer(r"REPLACE_WITH_\w+", line):
+                    found.append((f.relative_to(infra_dir), i, m.group(0)))
+        except OSError:
+            continue
+    return found
+
+
+def _print_next_steps(infra_dir: Path) -> None:
+    """Print a plain-English checklist of what the user must do before apply."""
+    placeholders = _scan_placeholders(infra_dir)
+    typer.secho("\n> NEXT STEPS — fill these before terraform plan/apply:", fg=typer.colors.CYAN, bold=True)
+    step = 1
+    seen: dict[str, list[str]] = {}
+    for path, line, ph in placeholders:
+        seen.setdefault(ph, []).append(f"{path}:{line}")
+    for ph, locations in seen.items():
+        hint = _PLACEHOLDER_HINTS.get(ph, "fill in the real value")
+        typer.secho(f"  {step}. {ph}", fg=typer.colors.YELLOW, bold=True)
+        typer.echo(f"     what : {hint}")
+        typer.echo(f"     where: {', '.join(locations[:4])}" + (" …" if len(locations) > 4 else ""))
+        step += 1
+    if not seen:
+        typer.secho("  [OK] No unfilled placeholders — scaffold is plan-ready.", fg=typer.colors.GREEN)
+    typer.echo(f"  {step}. Run: python scaffold-cli/main.py validate   (full quality gate)")
+    typer.echo(f"  {step+1}. Then: cd .infra && terraform init && terraform plan -var-file=env/dev/terraform.tfvars")
+
+
+def _hash_file(p: Path) -> str:
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _manifest_files(infra_dir: Path) -> list[Path]:
+    return [
+        f for f in sorted(infra_dir.rglob("*"))
+        if f.is_file() and not any(part in _MANIFEST_SKIP for part in f.parts)
+    ]
+
+
+def _load_manifest(infra_dir: Path) -> dict:
+    import json
+    p = infra_dir / _MANIFEST_NAME
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_manifest(infra_dir: Path, preserve_hashes: dict | None = None) -> None:
+    import json
+    hashes = {
+        str(f.relative_to(infra_dir)).replace("\\", "/"): _hash_file(f)
+        for f in _manifest_files(infra_dir)
+    }
+    # User-edited files keep their last *generated* hash so they remain
+    # detected as user-modified on subsequent runs.
+    hashes.update(preserve_hashes or {})
+    (infra_dir / _MANIFEST_NAME).write_text(
+        json.dumps({"version": 1, "files": hashes}, indent=2), encoding="utf-8"
+    )
+
+
+def _detect_user_edits(infra_dir: Path) -> dict[str, bytes]:
+    """Return {relpath: content} for files the user changed since last generation."""
+    manifest = _load_manifest(infra_dir).get("files", {})
+    if not manifest:
+        return {}
+    edited: dict[str, bytes] = {}
+    for rel, old_hash in manifest.items():
+        p = infra_dir / rel
+        if p.exists() and _hash_file(p) != old_hash:
+            edited[rel] = p.read_bytes()
+    return edited
+
+
+@app.command()
+def doctor():
+    """Diagnose the generated scaffold: placeholders, tools, and secrets."""
+    import shutil as _shutil
+    typer.secho("\n> Scaffold doctor\n", fg=typer.colors.CYAN, bold=True)
+    problems = 0
+
+    if not INFRA_DIR.exists():
+        typer.secho("  [X] No .infra directory found. Run 'init' first.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    # 1. Required tools
+    def _checkov_available() -> bool:
+        return bool(_resolve_checkov_cmd())
+
+    for tool, ok, why in [
+        ("terraform", bool(_shutil.which("terraform")), "required to plan/apply"),
+        ("checkov", _checkov_available(), "required for the security gate (pip install checkov)"),
+    ]:
+        if ok:
+            typer.secho(f"  [OK] {tool} available", fg=typer.colors.GREEN)
+        else:
+            typer.secho(f"  [!]  {tool} not found — {why}", fg=typer.colors.YELLOW)
+            problems += 1
+
+    # 2. Unfilled placeholders
+    placeholders = _scan_placeholders(INFRA_DIR)
+    if placeholders:
+        problems += 1
+        typer.secho(f"\n  [X] {len(placeholders)} unfilled placeholder(s):", fg=typer.colors.RED, bold=True)
+        for path, line, ph in placeholders[:12]:
+            hint = _PLACEHOLDER_HINTS.get(ph, "fill in the real value")
+            typer.echo(f"      {path}:{line}  {ph}")
+            typer.echo(f"        -> {hint}")
+        if len(placeholders) > 12:
+            typer.echo(f"      … and {len(placeholders) - 12} more")
+    else:
+        typer.secho("  [OK] No unfilled placeholders", fg=typer.colors.GREEN)
+
+    # 3. Secret scan
+    _scan_tfvars_for_secrets(INFRA_DIR)
+
+    # 4. User-modified files (informational)
+    edits = _detect_user_edits(INFRA_DIR)
+    if edits:
+        typer.secho(f"\n  [i] {len(edits)} file(s) modified since generation (will be preserved on re-init):", fg=typer.colors.BLUE)
+        for rel in list(edits)[:10]:
+            typer.echo(f"      {rel}")
+
+    if problems:
+        typer.secho(f"\n  Result: {problems} issue(s) to fix before apply.", fg=typer.colors.YELLOW, bold=True)
+        raise typer.Exit(1)
+    typer.secho("\n  Result: scaffold is healthy.", fg=typer.colors.GREEN, bold=True)
+
+
+@app.command()
+def validate(
+    plan: bool = typer.Option(False, "--plan", help="Also run 'terraform plan' (needs AWS credentials)"),
+):
+    """Full quality gate: terraform validate + Checkov + secret & placeholder scans."""
+    import subprocess, shutil as _shutil
+
+    if not INFRA_DIR.exists():
+        typer.secho("ERROR: no .infra directory. Run 'init' first.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    results: list[tuple[str, bool, str]] = []   # (gate, ok, detail)
+
+    # Gate 1: terraform init + validate
+    tf = _shutil.which("terraform")
+    if not tf:
+        results.append(("terraform validate", False, "terraform not found on PATH"))
+    else:
+        try:
+            init_r = subprocess.run(
+                [tf, "init", "-backend=false", "-input=false", "-no-color"],
+                cwd=INFRA_DIR, capture_output=True, text=True, timeout=300,
+            )
+            if init_r.returncode != 0:
+                results.append(("terraform validate", False, "init failed: " + init_r.stderr.strip().splitlines()[-1][:100] if init_r.stderr.strip() else "init failed"))
+            else:
+                val_r = subprocess.run(
+                    [tf, "validate", "-no-color"],
+                    cwd=INFRA_DIR, capture_output=True, text=True, timeout=120,
+                )
+                detail = "configuration is valid" if val_r.returncode == 0 else (val_r.stderr.strip().splitlines()[-1][:100] if val_r.stderr.strip() else "validate failed")
+                results.append(("terraform validate", val_r.returncode == 0, detail))
+        except subprocess.TimeoutExpired:
+            results.append(("terraform validate", False, "timed out"))
+
+    # Gate 2: Checkov (reuses the scoring routine, which also prints details)
+    _run_checkov_score(INFRA_DIR)
+    report = INFRA_DIR / "checkov-report.txt"
+    if report.exists():
+        first = report.read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+        ok = "100%" in first or "GOOD" in first
+        results.append(("checkov security scan", ok, first))
+    else:
+        results.append(("checkov security scan", False, "checkov not available"))
+
+    # Gate 3: secret scan
+    _scan_tfvars_for_secrets(INFRA_DIR)
+    results.append(("tfvars secret scan", True, "see output above"))
+
+    # Gate 4: placeholders
+    placeholders = _scan_placeholders(INFRA_DIR)
+    results.append((
+        "placeholder check",
+        not placeholders,
+        "all values filled" if not placeholders else f"{len(placeholders)} unfilled — run 'doctor' for details",
+    ))
+
+    # Gate 5 (optional): terraform plan
+    if plan and tf:
+        plan_r = subprocess.run(
+            [tf, "plan", "-var-file=env/dev/terraform.tfvars", "-input=false", "-no-color", "-lock=false"],
+            cwd=INFRA_DIR, capture_output=True, text=True, timeout=600,
+        )
+        summary = next((l for l in plan_r.stdout.splitlines() if l.startswith("Plan:") or "No changes" in l), "")
+        detail = summary or (plan_r.stderr.strip().splitlines()[-1][:100] if plan_r.stderr.strip() else "plan failed")
+        results.append(("terraform plan (dev)", plan_r.returncode == 0, detail))
+
+    # Scorecard
+    typer.secho("\n> VALIDATION SCORECARD", fg=typer.colors.CYAN, bold=True)
+    failed = 0
+    for gate, ok, detail in results:
+        mark  = "[PASS]" if ok else "[FAIL]"
+        color = typer.colors.GREEN if ok else typer.colors.RED
+        typer.secho(f"  {mark} {gate:<24} {detail}", fg=color)
+        failed += 0 if ok else 1
+    if failed:
+        typer.secho(f"\n  {failed} gate(s) failed.", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(1)
+    typer.secho("\n  All gates passed — scaffold is ready.", fg=typer.colors.GREEN, bold=True)
 
 
 @app.command("init-backend")

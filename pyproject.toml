@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scaffold-cli"
+version = "0.9.0"
+description = "DevOps greenfield scaffold generator — infra.yaml to security-hardened Terraform"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "PyYAML>=6.0",
+    "Jinja2>=3.1.2",
+]
+
+[project.optional-dependencies]
+ai = [
+    "anthropic>=0.40.0",
+    "openai>=1.0.0",
+    "google-generativeai>=0.8.0",
+]
+scan = ["checkov>=3.0.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+scaffold = "main:app"
+
+# Flat-module layout: the CLI modules live in scaffold-cli/ and templates in
+# parent-repo/templates (resolved relative to generator.py). Install in
+# editable mode so template resolution keeps working:
+#   pip install -e .
+[tool.setuptools]
+package-dir = { "" = "scaffold-cli" }
+py-modules = [
+    "main",
+    "generator",
+    "dynamic_generator",
+    "engine",
+    "decisions",
+    "ai_client",
+    "config_extractor",
+    "interactive_prompts",
+    "pipeline_generator",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["scaffold-cli/tests"]
