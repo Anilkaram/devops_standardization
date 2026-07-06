@@ -811,8 +811,8 @@ def _run_checkov_score(infra_dir: Path) -> None:
     typer.echo(f"  Report saved: {(infra_dir / 'checkov-report.txt').absolute()}")
 
 
-def _scan_tfvars_for_secrets(infra_dir: Path) -> None:
-    """Warn if generated tfvars contain obvious plaintext secret patterns."""
+def _scan_tfvars_for_secrets(infra_dir: Path) -> int:
+    """Warn about plaintext secret patterns in tfvars. Returns finding count."""
     import re as _re
     _SECRET_PATTERNS = [
         r'(?i)(password|passwd|secret|api_key|api-key|token|private_key)\s*=\s*"[^"]{6,}"',
@@ -820,27 +820,56 @@ def _scan_tfvars_for_secrets(infra_dir: Path) -> None:
     ]
     _SAFE_PLACEHOLDERS = {"REPLACE_WITH", "your-", "example", "PLACEHOLDER", "TODO", "changeme"}
 
+    def _is_placeholder(text: str) -> bool:
+        return any(p.lower() in text.lower() for p in _SAFE_PLACEHOLDERS)
+
     found = []
     for tfvars in infra_dir.rglob("terraform.tfvars"):
         content = tfvars.read_text(encoding="utf-8", errors="ignore")
         for pattern in _SECRET_PATTERNS:
             for match in _re.finditer(pattern, content):
                 value = match.group(0)
-                if not any(p.lower() in value.lower() for p in _SAFE_PLACEHOLDERS):
+                if not _is_placeholder(value):
                     found.append((tfvars.relative_to(infra_dir), value[:60]))
+
+        # Block-aware scan: inside the `secrets = {` map, ANY quoted `value`
+        # is a real credential regardless of its key name.
+        lines = content.splitlines()
+        depth = 0            # brace depth relative to the secrets block
+        in_secrets = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.split("#", 1)[0]   # ignore comments
+            if not in_secrets:
+                if _re.match(r'\s*secrets\s*=\s*\{', stripped):
+                    in_secrets = True
+                    depth = stripped.count("{") - stripped.count("}")
+                continue
+            depth += stripped.count("{") - stripped.count("}")
+            m = _re.search(r'\bvalue\s*=\s*"([^"]+)"', stripped)
+            if m and not _is_placeholder(m.group(1)):
+                found.append((
+                    tfvars.relative_to(infra_dir),
+                    f'line {i}: secrets map contains a plaintext value = "{m.group(1)[:20]}..."',
+                ))
+            if depth <= 0:
+                in_secrets = False
 
     if found:
         typer.secho("\n! SECRET SCAN WARNING", fg=typer.colors.RED, bold=True)
         typer.secho(
             "  The following tfvars lines look like plaintext secrets.\n"
-            "  Move these values to AWS Secrets Manager and reference via secrets map.\n"
-            "  NEVER commit real credentials to source control.\n",
+            "  NEVER commit real credentials to source control. Instead:\n"
+            "    1. keep a placeholder in tfvars (e.g. value = \"changeme\"),\n"
+            "    2. apply, then set the real value out-of-band:\n"
+            "       aws secretsmanager put-secret-value --secret-id <name> --secret-string '<real value>'\n"
+            "    3. add ignore_changes = [secret_string] so Terraform never sees it.\n",
             fg=typer.colors.YELLOW,
         )
         for path, snippet in found:
             typer.secho(f"  {path}: {snippet}...", fg=typer.colors.RED)
     else:
         typer.secho("  [OK] Secret scan: no plaintext secrets detected in tfvars.", fg=typer.colors.GREEN)
+    return len(found)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -989,7 +1018,8 @@ def doctor():
         typer.secho("  [OK] No unfilled placeholders", fg=typer.colors.GREEN)
 
     # 3. Secret scan
-    _scan_tfvars_for_secrets(INFRA_DIR)
+    if _scan_tfvars_for_secrets(INFRA_DIR):
+        problems += 1
 
     # 4. User-modified files (informational)
     edits = _detect_user_edits(INFRA_DIR)
@@ -1050,8 +1080,12 @@ def validate(
         results.append(("checkov security scan", False, "checkov not available"))
 
     # Gate 3: secret scan
-    _scan_tfvars_for_secrets(INFRA_DIR)
-    results.append(("tfvars secret scan", True, "see output above"))
+    n_secrets = _scan_tfvars_for_secrets(INFRA_DIR)
+    results.append((
+        "tfvars secret scan",
+        n_secrets == 0,
+        "no plaintext secrets" if n_secrets == 0 else f"{n_secrets} plaintext secret(s) found — see above",
+    ))
 
     # Gate 4: placeholders
     placeholders = _scan_placeholders(INFRA_DIR)
