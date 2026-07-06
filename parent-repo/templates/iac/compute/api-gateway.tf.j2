@@ -22,6 +22,7 @@ resource "aws_apigatewayv2_api" "main" {
 }
 
 resource "aws_cloudwatch_log_group" "api_gw" {
+  #checkov:skip=CKV_AWS_338:Retention is environment-driven via var.log_retention_days (365 in prod tfvars)
   name              = "/aws/apigateway/{{ project_name }}-${var.environment}"
   retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
@@ -75,6 +76,10 @@ resource "aws_apigatewayv2_route" "default" {
   {% if auth_required %}
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
   authorization_type = "JWT"
+  {% else %}
+  # IAM auth by default — callers sign requests with SigV4. Switch to a Cognito
+  # JWT authorizer by setting auth.required in infra.yaml.
+  authorization_type = "AWS_IAM"
   {% endif %}
   target = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }

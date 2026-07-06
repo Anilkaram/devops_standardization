@@ -31,6 +31,7 @@ Variables flow:
 
 from pathlib import Path
 from typing import Any
+import re
 import typer
 from jinja2 import Environment, FileSystemLoader
 
@@ -620,8 +621,8 @@ def generate_scaffold(
             merged     = {**ctx, **extra_vars}
             try:
                 hcl = jinja_env.get_template(template).render(**merged)
-                _write_service_module(modules_dir, svc, hcl)
-                service_module_calls.append(_service_module_call(svc))
+                auto_vars = _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc, auto_vars))
                 wrote_any_service = True
             except Exception as e:
                 typer.secho(f"  ! failed {svc} ({template}): {e}", fg=typer.colors.YELLOW)
@@ -643,8 +644,8 @@ def generate_scaffold(
             )
             if result:
                 hcl, svc_vars = result
-                _write_service_module(modules_dir, svc, hcl)
-                service_module_calls.append(_service_module_call(svc))
+                auto_vars = _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc, auto_vars))
                 typer.secho(f"  + modules/{svc.replace('-','_')}/  [ai-generated]",
                             fg=typer.colors.CYAN)
                 dynamic_vars.extend(svc_vars)
@@ -1275,6 +1276,7 @@ resource "aws_lambda_function" "app" {
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
+  #checkov:skip=CKV_AWS_338:Retention is environment-driven via var.log_retention_days (365 in prod tfvars)
   name              = "/aws/lambda/${var.name_prefix}-func"
   retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
@@ -2595,18 +2597,45 @@ def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -
     vars_hcl   = _MODULE_VARS_TF.get(svc, _TAGS_VAR_FALLBACK)
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
+    # Auto-declare every var.* the module body references but variables.tf
+    # doesn't declare (Jinja templates reference environment/cost_centre/etc.
+    # that the static fallback vars file knows nothing about).
+    used     = set(re.findall(r'\bvar\.([A-Za-z_][A-Za-z0-9_]*)', main_hcl))
+    declared = set(re.findall(r'variable\s+"([^"]+)"', vars_hcl))
+    auto_declared = sorted(used - declared)
+    _AUTOVAR_TYPES: dict[str, tuple[str, str | None]] = {
+        # name: (type, default-literal or None = required, wired from root)
+        "environment":        ("string", None),
+        "project_name":       ("string", None),
+        "region":             ("string", None),
+        "cost_centre":        ("string", None),
+        "name_prefix":        ("string", None),
+        "tags":               ("map(string)", "{}"),
+        "log_retention_days": ("number", "365"),
+    }
+    for vname in auto_declared:
+        vtype, vdefault = _AUTOVAR_TYPES.get(vname, ("string", "null"))
+        block = f'variable "{vname}" {{\n  type = {vtype}\n'
+        if vdefault is not None:
+            block += f'  default = {vdefault}\n'
+        block += '}\n'
+        vars_hcl = vars_hcl.rstrip() + "\n\n" + block
+
     (mod_dir / "main.tf").write_text(header + main_hcl,  encoding="utf-8")
     (mod_dir / "variables.tf").write_text(vars_hcl,       encoding="utf-8")
     (mod_dir / "outputs.tf").write_text(output_hcl,       encoding="utf-8")
 
     typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
                 fg=typer.colors.CYAN)
+    return auto_declared
 
 
-def _service_module_call(svc: str) -> str:
+def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
     """
     Generate root main.tf module call block.
     Passes the whole map variable — not individual scalars.
+    extra_vars: auto-declared module vars (from _write_service_module) to wire
+    from root values when a known mapping exists.
     """
     mod_name = svc.replace("-", "_")
     _CALLS: dict[str, str] = {
@@ -2722,12 +2751,32 @@ def _service_module_call(svc: str) -> str:
             f'  tags                  = local.common_tags\n'
             f'}}\n'
         )
-    return _CALLS.get(svc, (
-        f'module "{mod_name}" {{\n'
-        f'  source = "./modules/{mod_name}"\n\n'
-        f'  tags = local.common_tags\n'
-        f'}}\n'
-    ))
+    if svc in _CALLS:
+        return _CALLS[svc]
+
+    # Default call: wire any auto-declared module vars that map to known root
+    # values (see _write_service_module). Vars without a mapping were declared
+    # with a default in the module, so they need no wiring here.
+    _ROOT_RHS = {
+        "environment":        "var.environment",
+        "project_name":       "var.project_name",
+        "region":             "var.region",
+        "cost_centre":        "var.cost_centre",
+        "name_prefix":        '"${var.project_name}-${var.environment}"',
+        "kms_key_arn":        "try(module.kms.key_arn, null)",
+        "vpc_id":             "module.vpc.vpc_id",
+        "private_subnet_ids": "module.vpc.private_subnets",
+        "public_subnet_ids":  "module.vpc.public_subnets",
+        "security_group_id":  "aws_security_group.app.id",
+    }
+    lines = [f'module "{mod_name}" {{', f'  source = "./modules/{mod_name}"', '']
+    wired = [(v, _ROOT_RHS[v]) for v in (extra_vars or []) if v in _ROOT_RHS]
+    width = max([len(v) for v, _ in wired] + [4])
+    for vname, rhs in wired:
+        lines.append(f'  {vname:<{width}} = {rhs}')
+    lines.append(f'  {"tags":<{width}} = local.common_tags')
+    lines.append('}')
+    return "\n".join(lines) + "\n"
 
 
 def _write_modules_scaffold(base: Path, services: list[str]) -> None:
@@ -3494,6 +3543,7 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
         "# Referenced by modules (alb, ec2, autoscaling, rds, ...) via their inputs.",
         "",
         'resource "aws_security_group" "app" {',
+        '  #checkov:skip=CKV2_AWS_5:Attached via module inputs (security_group_id) when compute/data services are present',
         '  name_prefix = "${local.name_prefix}-app-"',
         '  description = "Shared application security group"',
         "  vpc_id      = module.vpc.vpc_id",
