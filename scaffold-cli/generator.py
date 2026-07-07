@@ -1022,8 +1022,8 @@ def _inject_connection_wiring(call_block: str, mod_name: str,
     # Cognito wiring: if cognito is in services, api_gateway needs its outputs
     STATIC_WIRES: list[tuple[str, list[str]]] = [
         ("api_gateway", "cognito", [
-            '  cognito_client_id     = aws_cognito_user_pool_client.app.id',
-            '  cognito_issuer_url    = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.main.id}"',
+            '  cognito_client_id     = module.cognito.client_id',
+            '  cognito_issuer_url    = "https://cognito-idp.${var.region}.amazonaws.com/${module.cognito.user_pool_id}"',
         ]),
     ]
 
@@ -2519,7 +2519,29 @@ output "instance_arn" {
 }
 ''',
 
+    "cognito": '''\
+output "user_pool_id" {
+  description = "Cognito user pool ID"
+  value       = aws_cognito_user_pool.main.id
+}
+
+output "client_id" {
+  description = "Cognito user pool app client ID"
+  value       = aws_cognito_user_pool_client.app.id
+}
+
+output "user_pool_arn" {
+  description = "Cognito user pool ARN"
+  value       = aws_cognito_user_pool.main.arn
+}
+''',
+
     "api_gateway": '''\
+output "api_id" {
+  description = "API Gateway v2 API ID (used in CloudWatch alarm dimensions)"
+  value       = aws_apigatewayv2_api.main.id
+}
+
 output "api_endpoint" {
   description = "API Gateway v2 invoke URL"
   value       = aws_apigatewayv2_stage.default.invoke_url

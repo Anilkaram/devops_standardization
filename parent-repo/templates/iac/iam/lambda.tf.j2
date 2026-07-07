@@ -262,7 +262,7 @@ resource "aws_iam_role_policy" "lambda_cognito" {
         "cognito-idp:AdminListGroupsForUser",
         "cognito-idp:ListUsers"
       ]
-      Resource = "arn:aws:cognito-idp:*:*:userpool/*"
+      Resource = module.cognito.user_pool_arn
     }]
   })
 }

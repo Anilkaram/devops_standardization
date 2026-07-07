@@ -131,7 +131,7 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_description   = "API Gateway 5xx errors exceeded threshold"
 
   dimensions = {
-    ApiId = aws_apigatewayv2_api.main.id
+    ApiId = module.api_gateway.api_id
   }
 
   tags = {
