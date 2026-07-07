@@ -536,11 +536,27 @@ def _ask_compute(config: dict, dp: Path) -> dict:
                 ("lambda",      "Serverless. Best for event-driven, low-traffic, or prototype stage."),
                 ("ecs-fargate", "Containerised. Good balance of control and managed ops."),
                 ("eks",         "Kubernetes. Use when team has high ops maturity and large scale."),
+                ("ec2",         "Virtual machines. Full OS control. Good for stateful or legacy backends."),
+                ("none",        "No backend — static frontend only, or I'll define compute in infra.yaml."),
             ],
         )
         svcs = config.setdefault("services", [])
         if "static-site" not in svcs:
             svcs.append("static-site")
+        if backend == "none":
+            typer.secho(
+                "    No backend compute selected — generating the static frontend only.\n"
+                "    Add a compute service to infra.yaml later (e.g. ec2, lambda) to "
+                "generate the backend + CI/CD deploy stage.",
+                fg=typer.colors.YELLOW,
+            )
+            _log_and_echo(
+                "services.compute", "static-site (no backend)",
+                "interactive prompt",
+                f"{ptype} project generated frontend-only; user declined backend compute.",
+                decisions_path=dp,
+            )
+            return config
         if backend not in svcs:
             svcs.append(backend)
         if ptype == "chatbot" and "bedrock" not in svcs:
