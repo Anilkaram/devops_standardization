@@ -9,27 +9,27 @@
 #   {project.name}-{environment}-{resource-suffix}
 #
 # Separator rules:
-#   Hyphen   -   resource names       e.g. msp-data-platform-dev-func
-#   Slash    /   path-based names     e.g. msp-data-platform/dev/app  (Secrets Manager, log groups)
+#   Hyphen   -   resource names       e.g. three-tier-app-dev-func
+#   Slash    /   path-based names     e.g. three-tier-app/dev/app  (Secrets Manager, log groups)
 #   Snake    _   Terraform variables  e.g. lambda_timeout, eks_node_count
 #
-# Resource name examples (using project.name = "msp-data-platform"):
+# Resource name examples (using project.name = "three-tier-app"):
 #
-#   Lambda function          msp-data-platform-dev-func
-#   Lambda IAM role          msp-data-platform-dev-lambda-role
-#   EKS cluster              msp-data-platform-dev-eks
-#   EKS cluster IAM role     msp-data-platform-dev-eks-cluster-role
-#   EKS node group           msp-data-platform-dev-ng
-#   ECR repository           msp-data-platform-dev-app
-#   SQS queue                msp-data-platform-dev-queue
-#   SQS dead-letter queue    msp-data-platform-dev-dlq
-#   SNS topic                msp-data-platform-dev-notifications
-#   KMS key alias            alias/msp-data-platform-dev
-#   Secrets Manager (app)    msp-data-platform/dev/app
-#   Secrets Manager (eks)    msp-data-platform/dev/eks-auth
-#   CloudWatch log group     /aws/lambda/msp-data-platform-dev-func
-#   CloudWatch dashboard     msp-data-platform-dev
-#   CloudWatch alarm         msp-data-platform-dev-lambda-errors
+#   Lambda function          three-tier-app-dev-func
+#   Lambda IAM role          three-tier-app-dev-lambda-role
+#   EKS cluster              three-tier-app-dev-eks
+#   EKS cluster IAM role     three-tier-app-dev-eks-cluster-role
+#   EKS node group           three-tier-app-dev-ng
+#   ECR repository           three-tier-app-dev-app
+#   SQS queue                three-tier-app-dev-queue
+#   SQS dead-letter queue    three-tier-app-dev-dlq
+#   SNS topic                three-tier-app-dev-notifications
+#   KMS key alias            alias/three-tier-app-dev
+#   Secrets Manager (app)    three-tier-app/dev/app
+#   Secrets Manager (eks)    three-tier-app/dev/eks-auth
+#   CloudWatch log group     /aws/lambda/three-tier-app-dev-func
+#   CloudWatch dashboard     three-tier-app-dev
+#   CloudWatch alarm         three-tier-app-dev-lambda-errors
 #
 # FIELD RULES
 # ───────────
