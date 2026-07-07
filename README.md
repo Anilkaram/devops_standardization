@@ -61,6 +61,7 @@ terraform apply -var-file=env/dev/terraform.tfvars
 | `scaffold doctor` | Diagnose the scaffold: required tools present, unfilled `REPLACE_WITH_*` placeholders (with file:line + what each value means), plaintext-secret scan, list of user-modified files. Exit 1 if anything needs fixing |
 | `scaffold validate` | The quality gate. Five checks, one scorecard: **terraform validate**, **Checkov security scan** (with % score), **tfsec security scan** (second engine, fails on critical/high), **tfvars secret scan**, **placeholder check**. `--plan` adds a real `terraform plan`. Non-zero exit on any failure → drop it straight into CI |
 | `scaffold init-backend` | Bootstrap the S3 state bucket + DynamoDB lock table (run once), then patch `backend.tf` |
+| `scaffold update <svc...>` | **AI-assisted template refresh**: reviews the Jinja templates for deprecated arguments, new provider requirements, and missing best practices. The AI only proposes — every proposal is verified by regenerating a stack and running `terraform validate` before it's applied; originals are backed up to `templates/.backups/`. `--all` for every template, `--dry-run` to preview the diff, `-y` to skip confirmation. Needs an AI provider key (same as `--describe`) |
 | `scaffold services` | List the service catalog by category, showing which are static-template vs AI-generated |
 | `scaffold providers` | Show the configured AI provider/model (AI is only used for `--describe` and non-catalog services) |
 

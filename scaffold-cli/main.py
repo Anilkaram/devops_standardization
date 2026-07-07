@@ -1193,6 +1193,176 @@ def validate(
     typer.secho("\n  All gates passed — scaffold is ready.", fg=typer.colors.GREEN, bold=True)
 
 
+@app.command()
+def update(
+    services: list[str] = typer.Argument(
+        None,
+        help="Service template(s) to update (e.g. rds waf). Omit with --all for every template.",
+    ),
+    all_services: bool = typer.Option(False, "--all", help="Update every template-backed catalog service"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the proposed diff without writing anything"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply verified updates without confirmation"),
+):
+    """AI-assisted template refresh: deprecated args, provider changes, new best practices.
+
+    The AI only PROPOSES changes — each proposal is verified by regenerating a
+    full stack with the updated template and running terraform validate on it.
+    Originals are backed up to parent-repo/templates/.backups/ before writing.
+    """
+    import difflib, shutil as _shutil, subprocess, tempfile, time
+    import generator
+
+    catalog          = dg.load_catalog()
+    catalog_services = catalog.get("services", {})
+
+    if all_services:
+        targets = [s for s, e in catalog_services.items() if e.get("template")]
+    elif services:
+        targets = list(services)
+    else:
+        typer.secho("ERROR: name at least one service, or pass --all.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    templates_root = Path(generator.__file__).resolve().parent.parent / "parent-repo" / "templates"
+    client = aic.get_client(max_tokens=8192)
+    typer.secho(f"\n> AI provider: {aic.provider_info()}", fg=typer.colors.BLUE)
+
+    _SYSTEM = (
+        "You are a senior Terraform + AWS engineer maintaining Jinja2 templates that render "
+        "Terraform HCL. You update templates to current provider best practices."
+    )
+    _RULES = """\
+STRICT RULES:
+- Preserve every Jinja2 construct exactly: {{ var }}, {% if %}...{% endif %}, and template variable names.
+- Preserve existing #checkov:skip and #tfsec:ignore comments and their justifications.
+- Do NOT rename resources or variables (that would break wiring and existing state).
+- Only change what is outdated: deprecated arguments, arguments the AWS provider (~> 5.x) now requires,
+  missing security best practices (encryption, least privilege, logging).
+- If the template is already current, reply with exactly: NO_CHANGES
+- Otherwise reply with ONLY the complete updated template content. No explanations, no code fences."""
+
+    updated, skipped, failed = [], [], []
+
+    for svc in targets:
+        entry    = catalog_services.get(svc, {})
+        template = entry.get("template")
+        if not template:
+            typer.secho(f"  ~ {svc}: no Jinja template (static hardened HCL) — skipping.", fg=typer.colors.CYAN)
+            skipped.append(svc)
+            continue
+        tmpl_path = templates_root / template
+        if not tmpl_path.exists():
+            typer.secho(f"  ! {svc}: template {template} not found — skipping.", fg=typer.colors.YELLOW)
+            skipped.append(svc)
+            continue
+
+        original = tmpl_path.read_text(encoding="utf-8")
+        typer.secho(f"\n> {svc}  ({template})", fg=typer.colors.BLUE, bold=True)
+
+        prompt = (
+            f"Review this Jinja2 template that renders Terraform HCL for AWS '{svc}'.\n"
+            f"Update it per the rules.\n\n{_RULES}\n\n"
+            f"--- TEMPLATE ({template}) ---\n{original}"
+        )
+        response = client.complete(prompt, system=_SYSTEM)
+        if not response:
+            typer.secho("  ! No AI response — check provider key. Skipping.", fg=typer.colors.YELLOW)
+            failed.append(svc)
+            continue
+
+        proposed = response.strip()
+        if proposed.startswith("```"):
+            proposed = "\n".join(proposed.splitlines()[1:]).rsplit("```", 1)[0]
+        if proposed == "NO_CHANGES" or proposed.strip() == original.strip():
+            typer.secho("  [OK] Already up to date.", fg=typer.colors.GREEN)
+            continue
+
+        diff = list(difflib.unified_diff(
+            original.splitlines(), proposed.splitlines(),
+            fromfile=f"{template} (current)", tofile=f"{template} (proposed)", lineterm="",
+        ))
+        for line in diff[:80]:
+            color = (typer.colors.GREEN if line.startswith("+") else
+                     typer.colors.RED if line.startswith("-") else None)
+            typer.secho(f"  {line}", fg=color)
+        if len(diff) > 80:
+            typer.echo(f"  … {len(diff) - 80} more diff lines")
+
+        if dry_run:
+            typer.secho("  [dry-run] Not applied.", fg=typer.colors.CYAN)
+            continue
+
+        # ── Verify: regenerate a stack with the updated template, terraform validate it ──
+        typer.secho("  > Verifying proposal (generate + terraform validate)...", fg=typer.colors.BLUE)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            staged_templates = tmp / "templates"
+            _shutil.copytree(templates_root, staged_templates)
+            (staged_templates / template).write_text(proposed, encoding="utf-8")
+
+            verify_cfg = {
+                "project": {"name": "update-verify", "region": "us-east-1", "owner": "ci"},
+                "services": [svc] if svc in ("waf", "cognito") else [svc, "kms"],
+                "environments": {"dev": {}},
+            }
+            stack_dir = tmp / "stack"
+            try:
+                generator.generate_scaffold(
+                    verify_cfg, catalog,
+                    templates_dir=str(staged_templates), output_dir=str(stack_dir),
+                )
+            except Exception as exc:
+                typer.secho(f"  [X] Rejected — generation failed with proposal: {exc}", fg=typer.colors.RED)
+                failed.append(svc)
+                continue
+
+            tf = _shutil.which("terraform")
+            if tf:
+                init_r = subprocess.run([tf, "init", "-backend=false", "-input=false", "-no-color"],
+                                        cwd=stack_dir, capture_output=True, text=True, timeout=300)
+                val_r  = subprocess.run([tf, "validate", "-no-color"],
+                                        cwd=stack_dir, capture_output=True, text=True, timeout=120)
+                if init_r.returncode != 0 or val_r.returncode != 0:
+                    err = (val_r.stderr or init_r.stderr).strip().splitlines()
+                    typer.secho(f"  [X] Rejected — terraform validate failed: {err[-1] if err else 'unknown'}",
+                                fg=typer.colors.RED)
+                    reject_path = templates_root / ".backups" / f"{Path(template).name}.rejected.{int(time.time())}"
+                    reject_path.parent.mkdir(exist_ok=True)
+                    reject_path.write_text(proposed, encoding="utf-8")
+                    typer.echo(f"      Proposal saved for review: {reject_path}")
+                    failed.append(svc)
+                    continue
+                typer.secho("  [OK] Verified: terraform validate passes with the update.", fg=typer.colors.GREEN)
+            else:
+                typer.secho("  [!] terraform not on PATH — verified generation only.", fg=typer.colors.YELLOW)
+
+        if not yes and not typer.confirm(f"  Apply verified update to {template}?"):
+            typer.secho("  Skipped by user.", fg=typer.colors.CYAN)
+            skipped.append(svc)
+            continue
+
+        backup = templates_root / ".backups" / f"{Path(template).name}.{int(time.time())}"
+        backup.parent.mkdir(exist_ok=True)
+        backup.write_text(original, encoding="utf-8")
+        tmpl_path.write_text(proposed, encoding="utf-8")
+        typer.secho(f"  [OK] Updated {template}  (backup: {backup.relative_to(templates_root)})",
+                    fg=typer.colors.GREEN, bold=True)
+        updated.append(svc)
+
+    typer.secho("\n> UPDATE SUMMARY", fg=typer.colors.CYAN, bold=True)
+    typer.echo(f"  updated : {updated or '—'}")
+    typer.echo(f"  skipped : {skipped or '—'}")
+    typer.echo(f"  failed  : {failed or '—'}")
+    if updated:
+        typer.secho(
+            "\n  Next: re-run 'scaffold init' in your project to regenerate with the "
+            "updated templates, then 'scaffold validate'.",
+            fg=typer.colors.CYAN,
+        )
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("init-backend")
 def init_backend(
     bucket: str = typer.Option(
