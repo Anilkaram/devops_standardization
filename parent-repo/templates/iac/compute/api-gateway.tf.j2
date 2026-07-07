@@ -17,7 +17,6 @@ resource "aws_apigatewayv2_api" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -30,7 +29,6 @@ resource "aws_cloudwatch_log_group" "api_gw" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-apigw-logs"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -55,7 +53,6 @@ resource "aws_apigatewayv2_stage" "default" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api-stage"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

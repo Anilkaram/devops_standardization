@@ -24,7 +24,7 @@ Output structure:
 Variables flow:
   variables.tf   declarations (name + type + description, no default)
   env/{env}/terraform.tfvars  actual values per environment
-    Base vars  : project_name, region, owner, environment, vpc_cidr, cost_centre
+    Base vars  : project_name, region, owner, environment, vpc_cidr
     Static vars: well-known per-service vars (eks_instance_type, db_instance_class)
     Dynamic vars: Claude API returns variables[] alongside terraform_hcl
 """
@@ -61,8 +61,6 @@ BASE_VARS: list[dict] = [
      "description": "Deployment environment (dev, staging, prod, uat)"},
     {"name": "vpc_cidr",     "type": "string",
      "description": "CIDR block for the VPC (e.g. 10.0.0.0/16)"},
-    {"name": "cost_centre",  "type": "string",
-     "description": "Cost centre code for billing and tagging"},
 ]
 
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -747,7 +745,6 @@ def generate_scaffold(
 _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
     "alb": [
         ("environment",            "string",       "var.environment"),
-        ("cost_centre",            "string",       "var.cost_centre"),
         ("vpc_id",                 "string",       "module.vpc.vpc_id"),
         ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
         ("security_group_id",      "string",       "aws_security_group.app.id"),
@@ -773,7 +770,6 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         # Universal
         ("environment",             "string",      "var.environment"),
         ("region",                  "string",      "var.region"),
-        ("cost_centre",             "string",      "var.cost_centre"),
         ("tags",                    "map(string)", "local.common_tags"),
     ],
     "eks": [
@@ -792,14 +788,12 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         # Universal
         ("environment",           "string",       "var.environment"),
         ("region",                "string",       "var.region"),
-        ("cost_centre",           "string",       "var.cost_centre"),
         ("tags",                  "map(string)",  "local.common_tags"),
     ],
     "ecs": [
         ("name_prefix",   "string",      '"${var.project_name}-${var.environment}"'),
         ("environment",   "string",      "var.environment"),
         ("region",        "string",      "var.region"),
-        ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
     ],
     "rds": [
@@ -808,7 +802,6 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("db_username",   "string",      "var.db_username"),
         ("environment",   "string",      "var.environment"),
         ("region",        "string",      "var.region"),
-        ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
     ],
     # ec2 sizing vars are prefixed per-instance at call-site (var.ec2_java_instance_type)
@@ -826,7 +819,6 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
     "api_gateway": [
         ("environment",          "string", "var.environment"),
         ("app_domain",           "string", '""'),
-        ("cost_centre",          "string", "var.cost_centre"),
         ("log_retention_days",   "number", "var.log_retention_days"),
         ("kms_key_arn",          "string", "try(module.kms.key_arn, null)"),
         ("lambda_invoke_arn",    "string", "module.lambda.invoke_arn"),
@@ -1836,10 +1828,6 @@ variable "environment" {
   default = "dev"
 }
 
-variable "cost_centre" {
-  type    = string
-  default = "REPLACE_WITH_COST_CENTRE"
-}
 
 variable "private_subnet_ids" {
   type        = list(string)
@@ -1870,7 +1858,6 @@ variable "tags" {
 ''',
     "rds": '''\
 variable "environment"        { type = string }
-variable "cost_centre"        { type = string }
 variable "private_subnet_ids" { type = list(string) }
 variable "security_group_id"  { type = string }
 
@@ -1891,7 +1878,6 @@ variable "tags" {
 ''',
     "mysql": '''\
 variable "environment"        { type = string }
-variable "cost_centre"        { type = string }
 variable "private_subnet_ids" { type = list(string) }
 variable "security_group_id"  { type = string }
 
@@ -1920,7 +1906,6 @@ variable "lambda_exec_role_arn" { type = string }
 variable "log_retention_days" { type = number }
 variable "environment" { type = string }
 variable "region" { type = string }
-variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
 variable "kms_key_arn" {
@@ -1971,7 +1956,6 @@ variable "subnet_private_ids" { type = list(string) }
 variable "subnet_public_ids" { type = list(string) }
 variable "environment" { type = string }
 variable "region" { type = string }
-variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
 variable "kms_key_arn" {
@@ -2314,10 +2298,6 @@ variable "app_domain" {
   default     = ""
 }
 
-variable "cost_centre" {
-  description = "Cost centre for tagging"
-  type        = string
-}
 
 variable "log_retention_days" {
   description = "CloudWatch log retention in days"
@@ -2629,7 +2609,7 @@ def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
 
     # Auto-declare every var.* the module body references but variables.tf
-    # doesn't declare (Jinja templates reference environment/cost_centre/etc.
+    # doesn't declare (Jinja templates reference environment/region/etc.
     # that the static fallback vars file knows nothing about).
     used     = set(re.findall(r'\bvar\.([A-Za-z_][A-Za-z0-9_]*)', main_hcl))
     declared = set(re.findall(r'variable\s+"([^"]+)"', vars_hcl))
@@ -2639,7 +2619,6 @@ def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -
         "environment":        ("string", None),
         "project_name":       ("string", None),
         "region":             ("string", None),
-        "cost_centre":        ("string", None),
         "name_prefix":        ("string", None),
         "tags":               ("map(string)", "{}"),
         "log_retention_days": ("number", "365"),
@@ -2746,7 +2725,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'module "api_gateway" {{\n'
             f'  source = "./modules/api_gateway"\n\n'
             f'  environment          = var.environment\n'
-            f'  cost_centre          = var.cost_centre\n'
             f'  log_retention_days   = var.log_retention_days\n'
             f'  kms_key_arn          = try(module.kms.key_arn, null)\n'
             f'  lambda_invoke_arn    = module.lambda.invoke_arn\n'
@@ -2759,7 +2737,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
         f'module "{mod_name}" {{\n'
         f'  source = "./modules/{mod_name}"\n\n'
         f'  environment        = var.environment\n'
-        f'  cost_centre        = var.cost_centre\n'
         f'  multi_az           = var.multi_az\n'
         f'  private_subnet_ids = module.vpc.private_subnets\n'
         f'  security_group_id  = aws_security_group.app.id\n'
@@ -2774,7 +2751,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'module "autoscaling" {{\n'
             f'  source = "./modules/autoscaling"\n\n'
             f'  environment           = var.environment\n'
-            f'  cost_centre           = var.cost_centre\n'
             f'  private_subnet_ids    = module.vpc.private_subnets\n'
             f'  security_group_id     = aws_security_group.app.id\n'
             f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
@@ -2792,7 +2768,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
         "environment":        "var.environment",
         "project_name":       "var.project_name",
         "region":             "var.region",
-        "cost_centre":        "var.cost_centre",
         "name_prefix":        '"${var.project_name}-${var.environment}"',
         "kms_key_arn":        "try(module.kms.key_arn, null)",
         "vpc_id":             "module.vpc.vpc_id",
@@ -2833,7 +2808,7 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         "# Ref: https://registry.terraform.io/browse/modules?provider=aws\n"
         "#\n"
         "# SECURITY DEFAULTS ENFORCED\n"
-        "#   - All resources tagged with Project/Owner/Environment/CostCenter\n"
+        "#   - All resources tagged with Project/Owner/Environment\n"
         "#   - Encryption at rest enforced in each service module (KMS CMK)\n"
         "#   - S3: block_public_access enabled on every bucket\n"
         "#   - SQS/SNS: sqs_managed_sse_enabled = true; kms_master_key_id set\n"
@@ -2860,7 +2835,6 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         f'      Project     = var.project_name\n'
         f'      Owner       = var.owner\n'
         f'      Environment = var.environment\n'
-        f'      CostCenter  = var.cost_centre\n'
         f'      ManagedBy   = "devops-scaffold-tool"\n'
         f'    }}\n'
         f'  }}\n'
@@ -2874,7 +2848,6 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         f'    Project     = var.project_name\n'
         f'    Owner       = var.owner\n'
         f'    Environment = var.environment\n'
-        f'    CostCenter  = var.cost_centre\n'
         f'    ManagedBy   = "devops-scaffold-tool"\n'
         f'  }}\n'
         f'}}\n'
@@ -3424,7 +3397,6 @@ sns = {{
             f'environment  = "{env_name}"',
             f'owner        = "{owner}"',
             f'vpc_cidr     = "10.0.0.0/16"',
-            f'cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
 
         if scalar_lines:
@@ -3447,7 +3419,6 @@ sns = {{
             f'# environment  = "{env_name}"',
             f'# owner        = "REPLACE_WITH_OWNER"',
             f'# vpc_cidr     = "10.0.0.0/16"',
-            f'# cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
         for line in scalar_lines:
             example_lines.append(f'# {line}')

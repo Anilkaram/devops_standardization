@@ -52,7 +52,6 @@ resource "aws_cognito_user_pool" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-pool"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

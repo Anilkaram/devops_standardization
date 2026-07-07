@@ -35,7 +35,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-errors"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -60,7 +59,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_throttles" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-throttles"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -85,7 +83,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-duration"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -111,7 +108,6 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-cpu-high"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -137,7 +133,6 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api-5xx"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -163,7 +158,6 @@ resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-dlq-depth"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}

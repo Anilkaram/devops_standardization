@@ -10,7 +10,6 @@ resource "aws_sns_topic" "notifications" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-notifications"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

@@ -950,7 +950,6 @@ _PLACEHOLDER_HINTS = {
     "REPLACE_WITH_ACM_CERT_ARN":   "ACM certificate ARN for the ALB HTTPS listener (AWS Console > Certificate Manager)",
     "REPLACE_WITH_ALB_LOG_BUCKET": "S3 bucket that receives ALB access logs",
     "REPLACE_WITH_LOG_BUCKET":     "S3 bucket that receives ALB access logs",
-    "REPLACE_WITH_COST_CENTRE":    "your team/department cost-centre tag for billing reports",
     "REPLACE_WITH_AMI_ID":         "AMI ID for the EC2/autoscaling instances (e.g. latest Amazon Linux 2023 in your region)",
 }
 

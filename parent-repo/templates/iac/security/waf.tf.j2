@@ -87,7 +87,6 @@ resource "aws_wafv2_web_acl" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-waf"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -101,7 +100,6 @@ resource "aws_cloudwatch_log_group" "waf" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-waf-logs"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

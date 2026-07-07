@@ -2,7 +2,9 @@
 resource "aws_lb" "main" {
   #checkov:skip=CKV2_AWS_28:WAF association is attached separately via the waf module when present; add aws_wafv2_web_acl_association referencing this ALB ARN
   name               = "{{ project_name }}-${var.environment}-alb"
-  internal           = false
+  # Internet-facing by design: the public entry point of the stack
+  # (infra.yaml requests internet_facing). WAF + HTTPS-only listeners guard it.
+  internal           = false #tfsec:ignore:aws-elb-alb-not-public
   load_balancer_type = "application"
   security_groups    = [var.security_group_id]
   subnets            = var.public_subnet_ids
@@ -20,7 +22,6 @@ resource "aws_lb" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-alb"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -43,7 +44,6 @@ resource "aws_lb_target_group" "app" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-tg"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

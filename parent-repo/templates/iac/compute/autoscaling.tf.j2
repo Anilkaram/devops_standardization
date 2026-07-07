@@ -54,7 +54,6 @@ resource "aws_launch_template" "app" {
     tags = {
       Name        = "{{ project_name }}-${var.environment}-asg-instance"
       Environment = var.environment
-      CostCentre  = var.cost_centre
     }
   }
 }

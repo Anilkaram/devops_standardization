@@ -9,7 +9,6 @@ resource "aws_kms_key" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-kms"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

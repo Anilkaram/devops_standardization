@@ -16,7 +16,6 @@ resource "aws_vpc" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-vpc"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -33,7 +32,6 @@ resource "aws_subnet" "public" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-pub-${count.index + 1}"
     Environment = var.environment
-    CostCentre  = var.cost_centre
     # EKS subnet auto-discovery tags
     "kubernetes.io/role/elb" = "1"
   }
@@ -49,7 +47,6 @@ resource "aws_subnet" "private" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-priv-${count.index + 1}"
     Environment = var.environment
-    CostCentre  = var.cost_centre
     # EKS subnet auto-discovery tags
     "kubernetes.io/role/internal-elb" = "1"
   }
@@ -62,7 +59,6 @@ resource "aws_internet_gateway" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-igw"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -74,7 +70,6 @@ resource "aws_eip" "nat" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-nat-eip"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -86,7 +81,6 @@ resource "aws_nat_gateway" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-nat"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 
   depends_on = [aws_internet_gateway.main]
@@ -104,7 +98,6 @@ resource "aws_route_table" "public" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rt-public"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -126,7 +119,6 @@ resource "aws_route_table" "private" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rt-private"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -153,7 +145,6 @@ resource "aws_security_group" "app" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-sg"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
