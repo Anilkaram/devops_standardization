@@ -581,7 +581,13 @@ def generate_scaffold(
             )
 
     if iam_blocks:
-        (base / "iam.tf").write_text("\n".join(iam_blocks) + "\n", encoding="utf-8")
+        iam_content = "\n".join(iam_blocks) + "\n"
+        # Policies scope ARNs to the deploying account via aws_caller_identity;
+        # declare the data source once at root if no block already does.
+        if ("data.aws_caller_identity.current" in iam_content
+                and 'data "aws_caller_identity" "current"' not in iam_content):
+            iam_content = 'data "aws_caller_identity" "current" {}\n\n' + iam_content
+        (base / "iam.tf").write_text(iam_content, encoding="utf-8")
 
     # "" Per-service modules (each service → modules/<svc>/{main,variables,outputs}.tf) ""
     # Root main.tf gets a module call block for each service.
@@ -1294,6 +1300,9 @@ resource "aws_eks_cluster" "main" {
   vpc_config {
     subnet_ids              = concat(var.subnet_private_ids, var.subnet_public_ids)
     endpoint_private_access = true
+    # Public endpoint only outside prod (kubectl access for dev teams); prod is private-only.
+    #tfsec:ignore:aws-eks-no-public-cluster-access
+    #tfsec:ignore:aws-eks-no-public-cluster-access-to-cidr
     endpoint_public_access  = var.environment != "prod"
     public_access_cidrs     = var.eks_public_access_cidrs
     security_group_ids      = compact([var.security_group_id])

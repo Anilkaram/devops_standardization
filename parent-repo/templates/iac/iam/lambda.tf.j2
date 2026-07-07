@@ -95,7 +95,7 @@ resource "aws_iam_role_policy" "lambda_kms" {
       Sid    = "KMSDecrypt"
       Effect = "Allow"
       Action = ["kms:Decrypt", "kms:GenerateDataKey"]
-      Resource = "arn:aws:kms:*:*:key/*"
+      Resource = module.kms.key_arn
     }]
   })
 }

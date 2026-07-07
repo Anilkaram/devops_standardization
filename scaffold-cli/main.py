@@ -811,6 +811,74 @@ def _run_checkov_score(infra_dir: Path) -> None:
     typer.echo(f"  Report saved: {(infra_dir / 'checkov-report.txt').absolute()}")
 
 
+def _resolve_tfsec_cmd() -> list:
+    """Locate a runnable tfsec (or trivy as its successor). Returns [] if absent."""
+    import shutil, os
+
+    candidates = []
+    binary = shutil.which("tfsec")
+    if binary:
+        candidates.append([binary])
+    # Well-known local install locations (doctor suggests E:\tf-tools on Windows)
+    for p in (os.environ.get("TFSEC_PATH", ""), r"E:\tf-tools\tfsec.exe", "/usr/local/bin/tfsec"):
+        if p and Path(p).exists():
+            candidates.append([p])
+    if candidates:
+        return candidates[0]
+    # Fall back to trivy (tfsec's successor) if present
+    trivy = shutil.which("trivy")
+    if trivy:
+        return [trivy, "config"]
+    return []
+
+
+def _run_tfsec_scan(infra_dir: Path) -> tuple[bool, str]:
+    """
+    Run tfsec (or trivy config) on the scaffold. Returns (ok, detail).
+    ok is True when the scan ran and found no HIGH/CRITICAL issues,
+    or when the scanner is not installed (soft-skip with hint).
+    """
+    import subprocess, re as _re
+
+    typer.secho("\n> tfsec security scan...", fg=typer.colors.BLUE, bold=True)
+    cmd = _resolve_tfsec_cmd()
+    if not cmd:
+        typer.secho(
+            "  [!] tfsec not found — install from https://github.com/aquasecurity/tfsec/releases\n"
+            "      (or set TFSEC_PATH to the binary). Skipping this gate.",
+            fg=typer.colors.YELLOW,
+        )
+        return True, "not installed — skipped (install tfsec to enable)"
+
+    is_trivy = "trivy" in Path(cmd[0]).name.lower()
+    # --exclude-downloaded-modules: registry module internals (.terraform cache)
+    # are third-party code — not ours to fix and not part of the gate.
+    args = cmd + ([str(infra_dir)] if is_trivy else [str(infra_dir), "--no-color", "--exclude-downloaded-modules"])
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "tfsec timed out (>300s)"
+    output = r.stdout + r.stderr
+
+    # tfsec summary: "critical: N high: N medium: N low: N" (in "N potential problems" block)
+    counts = dict(_re.findall(r"(critical|high|medium|low)\s*:?\s*(\d+)", output, _re.IGNORECASE))
+    crit = int(counts.get("critical", counts.get("CRITICAL", 0)))
+    high = int(counts.get("high", counts.get("HIGH", 0)))
+    med  = int(counts.get("medium", counts.get("MEDIUM", 0)))
+    low  = int(counts.get("low", counts.get("LOW", 0)))
+    total = crit + high + med + low
+
+    (infra_dir / "tfsec-report.txt").write_text(output, encoding="utf-8")
+    typer.echo(f"  critical: {crit}  high: {high}  medium: {med}  low: {low}")
+    typer.echo(f"  Report saved: {(infra_dir / 'tfsec-report.txt').absolute()}")
+
+    if crit or high:
+        return False, f"{crit} critical / {high} high findings — see tfsec-report.txt"
+    if total:
+        return True, f"no critical/high ({med} medium, {low} low — see tfsec-report.txt)"
+    return True, "no findings"
+
+
 def _scan_tfvars_for_secrets(infra_dir: Path) -> int:
     """Warn about plaintext secret patterns in tfvars. Returns finding count."""
     import re as _re
@@ -887,7 +955,7 @@ _PLACEHOLDER_HINTS = {
 }
 
 _MANIFEST_NAME = ".scaffold-manifest.json"
-_MANIFEST_SKIP = {".terraform", ".terraform.lock.hcl", "checkov-report.txt", _MANIFEST_NAME, "generation-error.log", "decisions.md"}
+_MANIFEST_SKIP = {".terraform", ".terraform.lock.hcl", "checkov-report.txt", "tfsec-report.txt", _MANIFEST_NAME, "generation-error.log", "decisions.md"}
 
 
 def _scan_placeholders(infra_dir: Path) -> list[tuple[Path, int, str]]:
@@ -993,15 +1061,17 @@ def doctor():
     def _checkov_available() -> bool:
         return bool(_resolve_checkov_cmd())
 
-    for tool, ok, why in [
-        ("terraform", bool(_shutil.which("terraform")), "required to plan/apply"),
-        ("checkov", _checkov_available(), "required for the security gate (pip install checkov)"),
+    for tool, ok, required, why in [
+        ("terraform", bool(_shutil.which("terraform")), True, "required to plan/apply"),
+        ("checkov", _checkov_available(), True, "required for the security gate (pip install checkov)"),
+        ("tfsec", bool(_resolve_tfsec_cmd()), False, "optional second security scanner (github.com/aquasecurity/tfsec/releases)"),
     ]:
         if ok:
             typer.secho(f"  [OK] {tool} available", fg=typer.colors.GREEN)
         else:
             typer.secho(f"  [!]  {tool} not found — {why}", fg=typer.colors.YELLOW)
-            problems += 1
+            if required:
+                problems += 1
 
     # 2. Unfilled placeholders
     placeholders = _scan_placeholders(INFRA_DIR)
@@ -1079,7 +1149,11 @@ def validate(
     else:
         results.append(("checkov security scan", False, "checkov not available"))
 
-    # Gate 3: secret scan
+    # Gate 3: tfsec (second security scanner — different rule engine than Checkov)
+    tfsec_ok, tfsec_detail = _run_tfsec_scan(INFRA_DIR)
+    results.append(("tfsec security scan", tfsec_ok, tfsec_detail))
+
+    # Gate 4: secret scan
     n_secrets = _scan_tfvars_for_secrets(INFRA_DIR)
     results.append((
         "tfvars secret scan",

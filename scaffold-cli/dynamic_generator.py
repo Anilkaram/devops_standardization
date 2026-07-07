@@ -508,6 +508,10 @@ def generate_iam_policy_block(
             raw_arns      = arn_templates.get(svc, ["*"])
             resolved_arns = [
                 a.replace("{project}", project_name).replace("{region}", region)
+                 # Scope the account field (catalog templates use ':*:') to the
+                 # deploying account — tfsec flags wildcarded accounts on
+                 # sensitive actions like logs:CreateLogGroup.
+                 .replace(":*:", ":${data.aws_caller_identity.current.account_id}:")
                 for a in raw_arns
             ]
             all_statements.append({

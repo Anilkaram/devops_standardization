@@ -59,7 +59,7 @@ terraform apply -var-file=env/dev/terraform.tfvars
 |---|---|
 | `scaffold init` | Generate the full Terraform workspace from `infra.yaml`. Ends with a **NEXT STEPS checklist** of values you must fill. Re-running preserves files you edited (`--force` to overwrite; `--dry-run` to preview) |
 | `scaffold doctor` | Diagnose the scaffold: required tools present, unfilled `REPLACE_WITH_*` placeholders (with file:line + what each value means), plaintext-secret scan, list of user-modified files. Exit 1 if anything needs fixing |
-| `scaffold validate` | The quality gate. Four checks, one scorecard: **terraform validate**, **Checkov security scan** (with % score), **tfvars secret scan**, **placeholder check**. `--plan` adds a real `terraform plan`. Non-zero exit on any failure → drop it straight into CI |
+| `scaffold validate` | The quality gate. Five checks, one scorecard: **terraform validate**, **Checkov security scan** (with % score), **tfsec security scan** (second engine, fails on critical/high), **tfvars secret scan**, **placeholder check**. `--plan` adds a real `terraform plan`. Non-zero exit on any failure → drop it straight into CI |
 | `scaffold init-backend` | Bootstrap the S3 state bucket + DynamoDB lock table (run once), then patch `backend.tf` |
 | `scaffold services` | List the service catalog by category, showing which are static-template vs AI-generated |
 | `scaffold providers` | Show the configured AI provider/model (AI is only used for `--describe` and non-catalog services) |
@@ -201,7 +201,7 @@ After generation, `infra.yaml.example` is written next to your file with the com
 
 ## Built-in guardrails
 
-- **Security-hardened templates** — encryption at rest (KMS/SSE), IMDSv2, private subnets for data services, log retention, WAF managed rules. Verified by the bundled Checkov scan on every `init`.
+- **Security-hardened templates** — encryption at rest (KMS/SSE), IMDSv2, private subnets for data services, account-scoped IAM ARNs, log retention, WAF managed rules. Verified by **two independent scanners**: Checkov on every `init`, plus tfsec in `scaffold validate` (skipped with a hint if not installed).
 - **Secret scan** — plaintext credentials in any tfvars (including `value = "..."` inside the `secrets` map) are reported with file + line and fail `doctor`/`validate`. Remediation guidance included (`aws secretsmanager put-secret-value` post-apply).
 - **Placeholder discipline** — values only you can know (ACM cert ARN, state bucket, AMI ID) are generated as `REPLACE_WITH_*` and tracked until you fill them.
 - **Idempotent regeneration** — `.infra/.scaffold-manifest.json` fingerprints every generated file; re-running `init` after you customized a module keeps your changes.
@@ -211,6 +211,7 @@ After generation, `infra.yaml.example` is written next to your file with the com
 ## Requirements
 
 - Python ≥ 3.10, Terraform ≥ 1.5, Checkov (`pip install checkov`) for the security gate
+- Optional: tfsec (or Trivy) for the second security gate — [releases](https://github.com/aquasecurity/tfsec/releases), or set `TFSEC_PATH` to the binary
 - An AI provider key only if you use `--describe` or non-catalog services (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY`)
 
 ## Repository layout
