@@ -1677,11 +1677,6 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
 
   alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
 }
-
-resource "aws_cloudwatch_dashboard" "main" {
-  dashboard_name = var.dashboard.name
-  dashboard_body = jsonencode(var.dashboard.body)
-}
 ''',
 
     "s3": '''\
@@ -2193,15 +2188,6 @@ variable "cloudwatch_alarms" {
   default = { lambdas = {}, sqs = {}, dlq = {} }
 }
 
-variable "dashboard" {
-  description = "CloudWatch dashboard config."
-  type = object({
-    name = string
-    body = any
-  })
-  default = null
-}
-
 variable "kms_key_arn" {
   description = "KMS key ARN used to encrypt CloudWatch log groups."
   type        = string
@@ -2476,11 +2462,6 @@ output "log_group_names" {
     for k, lg in aws_cloudwatch_log_group.lambdas : k => lg.name
   }
 }
-
-output "dashboard_name" {
-  description = "CloudWatch dashboard name."
-  value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
-}
 ''',
 
     "s3": '''\
@@ -2729,7 +2710,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'  sns_topic_arn      = null\n'
             f'  lambda_log_groups  = local.lambda_log_groups\n'
             f'  cloudwatch_alarms  = var.cloudwatch_alarms\n'
-            f'  dashboard          = var.dashboard\n'
             f'  kms_key_arn        = try(module.kms.key_arn, null)\n'
             f'  tags               = local.common_tags\n'
             f'}}\n'
@@ -3122,15 +3102,6 @@ variable "cloudwatch_alarms" {
   })
   default = { lambdas = {}, sqs = {}, dlq = {} }
 }
-
-variable "dashboard" {
-  description = "CloudWatch dashboard config."
-  type = object({
-    name = string
-    body = any
-  })
-  default = null
-}
 ''',
     }
 
@@ -3517,7 +3488,6 @@ sns = {{
                 "cloudwatch_alarms = {\n"
                 + _lambdas_blk + _sqs_blk + _dlq_blk +
                 "}\n\n"
-                f'dashboard = {{\n  name = "{project_name}-{env_name}-dashboard"\n  body = {{}}\n}}\n'
             )
 
         # Assemble tfvars
@@ -3931,8 +3901,8 @@ _SERVICE_COST_ESTIMATES: dict[str, dict] = {
         "optimise": ["Store multiple related values as one JSON secret", "Use SSM Parameter Store (free tier) for non-sensitive config"],
     },
     "cloudwatch": {
-        "dev":  {"estimate": "$2–8",   "basis": "5 GB logs/mo, 5 alarms, 1 dashboard"},
-        "prod": {"estimate": "$20–60", "basis": "50 GB logs/mo, 20 alarms, 3 dashboards"},
+        "dev":  {"estimate": "$2–8",   "basis": "5 GB logs/mo, 5 alarms"},
+        "prod": {"estimate": "$20–60", "basis": "50 GB logs/mo, 20 alarms"},
         "notes": "First 5 GB logs/mo free. $0.50/GB ingest after. Dashboard $3/mo each.",
         "optimise": ["Set log retention (avoid indefinite storage)", "Use metric filters instead of custom metrics where possible"],
     },
