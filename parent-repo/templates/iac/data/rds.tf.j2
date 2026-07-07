@@ -1,16 +1,40 @@
 # RDS — managed relational database (aws provider ~> 6.0)
 resource "aws_db_subnet_group" "main" {
   name       = "{{ project_name }}-${var.environment}-rds-subnet-grp"
-  subnet_ids = aws_subnet.private[*].id
+  subnet_ids = var.private_subnet_ids
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rds-subnet-grp"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
+# IAM role for RDS Enhanced Monitoring (required by monitoring_role_arn)
+data "aws_iam_policy_document" "rds_monitoring_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["monitoring.rds.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "rds_monitoring" {
+  name_prefix        = "{{ project_name }}-${var.environment}-rdsmon-"
+  assume_role_policy = data.aws_iam_policy_document.rds_monitoring_assume.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
 resource "aws_db_instance" "main" {
+  #checkov:skip=CKV_AWS_157:Multi-AZ is environment-driven via var.multi_az (prod=true, dev=false to save cost)
+  #checkov:skip=CKV_AWS_293:Deletion protection is environment-driven (prod=true); dev stays destroyable for teardown
+  #checkov:skip=CKV2_AWS_30:Query logging via a custom parameter group is engine/tuning-specific — enable per workload
   identifier     = "{{ project_name }}-${var.environment}-rds"
   engine         = "{{ db_engine | default('postgres') }}"
   engine_version = "{{ '17' if db_engine == 'postgres' else '8.4' }}"
@@ -25,20 +49,33 @@ resource "aws_db_instance" "main" {
   # Password managed by Secrets Manager — never hardcoded in state
   manage_master_user_password = true
 
+  # IAM database authentication (CKV_AWS_161)
+  iam_database_authentication_enabled = true
+
   db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.app.id]
+  vpc_security_group_ids = [var.security_group_id]
 
   multi_az                = var.multi_az
   backup_retention_period = var.environment == "prod" ? 35 : {{ backup_retention | default(7) }}
   backup_window           = "03:00-04:00"
   maintenance_window      = "Mon:04:00-Mon:05:00"
+  copy_tags_to_snapshot   = true               # CKV2_AWS_60
+  auto_minor_version_upgrade = true            # CKV_AWS_226
+
+  # Ship engine logs to CloudWatch (CKV_AWS_129)
+  enabled_cloudwatch_logs_exports = {{ '["postgresql", "upgrade"]' if db_engine != 'mysql' else '["audit", "error", "general", "slowquery"]' }}
 
   # Encryption at rest with CMK
   storage_encrypted = true
-  kms_key_id        = try(aws_kms_key.main.arn, null)
+  kms_key_id        = var.kms_key_arn
 
-  # Performance Insights — free for db.t3 instances
+  # Enhanced monitoring (CKV_AWS_118) — 60s granularity
+  monitoring_interval = 60
+  monitoring_role_arn = aws_iam_role.rds_monitoring.arn
+
+  # Performance Insights encrypted with CMK (CKV_AWS_354)
   performance_insights_enabled          = true
+  performance_insights_kms_key_id       = var.kms_key_arn
   performance_insights_retention_period = var.environment == "prod" ? 731 : 7
 
   # Use the latest recommended CA certificate
@@ -52,7 +89,6 @@ resource "aws_db_instance" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rds"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

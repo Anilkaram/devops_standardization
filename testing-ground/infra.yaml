@@ -1,118 +1,141 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# infra.yaml — Classic 3-Tier AWS Architecture
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# ARCHITECTURE OVERVIEW
+#   Internet → ALB (Public/DMZ subnet, spans AZ1 + AZ2)
+#            → Auto Scaling Group of EC2 Web App Servers (Private/APP subnet)
+#            → RDS Multi-AZ Primary + Standby (Private/RES subnet)
+#
+# SUBNET TIERS (inside VPC, across 2 Availability Zones)
+#   Public/DMZ   — Application Load Balancer
+#   Private/APP  — Web App Servers (EC2 in Auto Scaling Group)
+#   Private/RES  — Amazon RDS (Primary AZ1, Standby AZ2, Sync Replication)
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 project:
-  name: protecto-platform
+  name: three-tier-app
   region: us-east-1
   owner: platform-team
-  type: web-api-container-platform
+  type: web-application         # classic web app — ALB + EC2 + RDS
 
-stage: production
+stage: growth                   # multi-AZ + auto scaling → beyond prototype
 
 team:
-  size: medium
-  ops_maturity: high
+  size: small
+  ops_maturity: medium
 
 runtime:
-  language: python
-  containerised: true
+  language: node                # adjust to your web app language (node/python/java/go)
+  containerised: false          # diagram shows EC2 instances, not containers
 
 # ── Services ─────────────────────────────────────────────────────────────────
-# Direct mapping of all infrastructure components from the architecture diagram.
+# `type` = catalog keyword (what the tool uses to find the template)
+# `name` = instance identifier (used in resource names + connections)
 services:
-  # Edge & Content Delivery
-  - cloudfront            # CDN distributing static assets from S3 to end users via AWS WAF
-  - s3                    # Static file hosting (HTML, CSS, JS) behind CloudFront
 
-  # Security
-  - waf                   # AWS WAF inspects all incoming traffic from client devices
+  # -- networking --
+  - type: vpc
+    name: main-vpc
+    cidr: 10.0.0.0/16
+    availability_zones: 2       # AZ1 + AZ2 as shown in diagram
+    subnets:
+      public_dmz:               # Public/DMZ — ALB lives here
+        az1: 10.0.1.0/24
+      private_app:              # Private/APP — Web App Servers live here
+        az1: 10.0.2.0/24
+      private_res:              # Private/RES — RDS Primary + Standby live here
+        az1: 10.0.4.0/24
 
-  # API Entry Point
-  - api-gateway           # Receives API calls from WAF; routes to Lambda for processing
+  # -- load balancer (Public/DMZ subnet) --
+  - type: alb
+    name: app-load-balancer
+    subnet_tier: public_dmz     # deployed in public/DMZ subnets across both AZs
+    internet_facing: true
+    listener:
+      port: 443
+      protocol: HTTPS
+    target_group:
+      port: 80
+      protocol: HTTP
+      health_check_path: /health
 
-  # Compute (Lambda in public subnet, EKS in private subnet)
-  - lambda                # Processes API requests; orchestrates EKS workload operations
-  - eks                   # Managed Kubernetes cluster hosting containerised application pods
+  # -- compute (Private/APP subnet) --
+  - type: autoscaling
+    name: web-app-asg
+    subnet_tier: private_app    # instances launched in private/APP subnets
+    launch_template: web-app-server
 
-  # Container Registry (private subnet)
-  - ecr                   # Stores container images; EKS pulls images on deployment
+  - type: ec2
+    name: web-app-server        # Web App Server — managed by web-app-asg
+    subnet_tier: private_app
+    associate_public_ip: false  # private subnet — no direct internet access
 
-  # Security & Key Management
-  - kms                   # Encrypts S3 objects, EKS secrets, and ECR images at rest
-  - secrets-manager       # Stores EKS credentials and service account tokens securely
+  # -- database (Private/RES subnet) --
+  - type: rds
+    name: app-database
+    subnet_tier: private_res    # deployed in private/RES subnets
+    engine: mysql               # adjust to your DB engine (mysql/postgres/etc.)
+    multi_az: true              # Primary AZ1 + Standby AZ2, sync replication as shown
+    storage_encrypted: true
 
-  # Monitoring & Observability
-  - cloudwatch            # Collects logs and metrics from Lambda, EKS nodes, and API Gateway
+  # -- security --
+  - type: kms
+    name: app-kms-key           # encrypts RDS storage + any future secrets
+
+  - type: secrets-manager
+    name: db-credentials        # RDS username/password — fetched by web-app-server at runtime
+
+  # -- observability --
+  - type: cloudwatch
+    name: app-observability     # metrics + alarms for ALB, ASG, EC2, RDS
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 auth:
-  required: true
-  method: iam             # IAM roles for Lambda execution, ECR pull, and EKS node permissions
+  required: false               # no auth layer shown in diagram; add cognito/waf if needed
+  method: iam                   # EC2 instance role → RDS + Secrets Manager access
 
 # ── Connections ──────────────────────────────────────────────────────────────
 connections:
-  # Edge Traffic Flow
-  - { from: cloudfront,     to: s3            }  # CloudFront fetches static files from S3 origin
-  - { from: api-gateway,    to: lambda        }  # API Gateway invokes Lambda for all API calls
+  # internet → ALB → EC2 (via Auto Scaling Group)
+  - { from: app-load-balancer, to: web-app-asg }      # ALB routes to ASG target group
+  - { from: web-app-asg,       to: web-app-server }   # ASG manages EC2 instances
 
-  # Compute → Container Platform
-  - { from: lambda,         to: eks           }  # Lambda triggers workload operations on EKS
-  - { from: ecr,            to: eks           }  # EKS pulls container images from ECR on deploy
+  # EC2 → RDS
+  - { from: web-app-server,    to: app-database }      # app reads/writes to RDS primary
 
-  # Security Integration
-  - { from: kms,            to: s3            }  # KMS-SSE encrypts all S3 static file objects
-  - { from: kms,            to: eks           }  # KMS encrypts Kubernetes secrets at rest
-  - { from: secrets-manager, to: lambda       }  # Lambda fetches EKS credentials from Secrets Manager
+  # EC2 → Secrets Manager (fetch DB credentials at startup)
+  - { from: web-app-server,    to: db-credentials }
 
-  # Observability
-  - { from: lambda,         to: cloudwatch    }  # Lambda execution logs and error metrics
-  - { from: eks,            to: cloudwatch    }  # EKS Container Insights — node and pod metrics
-  - { from: api-gateway,    to: cloudwatch    }  # API Gateway access logs and latency metrics
+  # KMS encrypts RDS + Secrets Manager
+  - { from: app-kms-key,       to: app-database }
+  - { from: app-kms-key,       to: db-credentials }
 
-# ── Flows ────────────────────────────────────────────────────────────────────
-flows:
-  user_request_flow:
-    description: "End-user access journey: Client devices hit AWS WAF which inspects and filters traffic. Static asset requests are served via CloudFront from an S3 bucket. Dynamic API calls pass through API Gateway, invoke Lambda in the public subnet, which in turn communicates with the EKS cluster in the private subnet to process and return results."
-    services: [cloudfront, s3, api-gateway, lambda, eks]
-
-  container_deployment_flow:
-    description: "Container image delivery: New images are pushed to ECR. The EKS cluster pulls updated images directly from ECR within the private subnet via the Image Pull path. IAM roles control pull permissions and KMS encrypts image layers at rest."
-    services: [ecr, eks, kms]
-
-  observability_flow:
-    description: "Platform monitoring: Lambda, EKS nodes/pods, and API Gateway all emit logs and metrics to CloudWatch. Alarms can be configured on Lambda error rates, EKS CPU/memory, and API Gateway 5xx counts."
-    services: [lambda, eks, api-gateway, cloudwatch]
+  # observability
+  - { from: app-observability, to: app-load-balancer }
+  - { from: app-observability, to: web-app-server }
+  - { from: app-observability, to: app-database }
+  - { from: app-observability, to: web-app-asg }
 
 # ── Environments ─────────────────────────────────────────────────────────────
 environments:
   dev:
-    multi_az: false
-    eks:
-      node_count: 1
-      instance_type: t3.large
-    lambda:
-      memory_mb: 256
-      timeout_s: 30
-
-  uat:
-    multi_az: true
-    eks:
-      node_count: 2
-      instance_type: t3.xlarge
-    lambda:
-      memory_mb: 512
-      timeout_s: 30
-
-  prod:
-    multi_az: true
-    eks:
-      node_count: 3
-      instance_type: t3.2xlarge
-    lambda:
-      memory_mb: 1024
-      timeout_s: 30
+    multi_az: false             # single AZ for dev — cost saving
+    autoscaling:
+      web-app-asg:
+        min_size: 1
+        max_size: 2
+        desired_capacity: 1
+    ec2:
+      web-app-server:
+        instance_type: t3.small
+    rds:
+      app-database:
+        instance_class: db.t3.medium
+        multi_az: false
 
 # ── CI/CD ────────────────────────────────────────────────────────────────────
 cicd:
   auto_deploy:
     - dev
-  manual_deploy:
-    - uat
-    - prod

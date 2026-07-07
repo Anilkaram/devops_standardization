@@ -387,7 +387,10 @@ def generate_pipeline(
     rollback_steps = None
     secrets_needed = ["AWS_DEPLOY_ROLE_ARN"]
 
-    if use_ai:
+    # Only reach for AI when we don't already have a hardened static template
+    # for this compute type — no point calling the API for ec2/eks/lambda/fargate.
+    _has_static = compute in _STATIC_BUILD_STEPS
+    if use_ai and not _has_static:
         client = aic.get_client()
         if client.available:
             typer.secho(

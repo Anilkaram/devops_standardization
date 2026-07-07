@@ -14,7 +14,6 @@ resource "aws_cloudwatch_log_group" "app" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-app-logs"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

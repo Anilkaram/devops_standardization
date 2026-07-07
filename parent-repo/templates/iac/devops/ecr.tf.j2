@@ -19,7 +19,6 @@ resource "aws_ecr_repository" "app" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-ecr"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

@@ -58,11 +58,38 @@ def load_catalog() -> dict:
 
 
 def get_service_entry(catalog: dict, service: str) -> dict:
-    return catalog.get("services", {}).get(service, {})
+    svcs = catalog.get("services", {})
+    if service in svcs:
+        return svcs[service]
+    # role-suffixed name: ec2-java → look up ec2
+    base = _base_svc(service, catalog)
+    return svcs.get(base, {}) if base else {}
+
+
+def _base_svc(name: str, catalog: dict) -> str | None:
+    """Return the catalog base key for a role-suffixed service name.
+
+    ec2-java  → 'ec2'  (if 'ec2' is in catalog)
+    mysql-php → 'mysql'
+    s3-ui     → 's3'
+    Returns None if the name is already a catalog key or has no valid base.
+    """
+    svcs = catalog.get("services", {})
+    if name in svcs:
+        return None  # already a direct catalog key, no suffix
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and parts[0] in svcs:
+        return parts[0]
+    return None
 
 
 def get_all_valid_services(catalog: dict) -> set[str]:
     return set(catalog.get("services", {}).keys())
+
+
+def get_infra_layer_names(catalog: dict) -> set[str]:
+    """Infra layers (vpc, iam, security_group) are auto-generated, never services."""
+    return set(catalog.get("infra_layers", {}).keys())
 
 
 def get_compute_services(catalog: dict) -> set[str]:
@@ -70,6 +97,23 @@ def get_compute_services(catalog: dict) -> set[str]:
         name for name, entry in catalog.get("services", {}).items()
         if entry.get("category") == "compute"
     }
+
+
+def resolve_compute_services(services: list[str], catalog: dict) -> list[str]:
+    """Return items from *services* that map to a compute catalog entry.
+
+    Handles both exact catalog names ('ec2') and role-suffixed names ('ec2-java').
+    """
+    compute_bases = get_compute_services(catalog)
+    result = []
+    for svc in services:
+        if svc in compute_bases:
+            result.append(svc)
+        else:
+            base = _base_svc(svc, catalog)
+            if base and base in compute_bases:
+                result.append(svc)
+    return result
 
 
 def get_valid_compute_combinations(catalog: dict) -> list[list[str]]:
@@ -464,6 +508,10 @@ def generate_iam_policy_block(
             raw_arns      = arn_templates.get(svc, ["*"])
             resolved_arns = [
                 a.replace("{project}", project_name).replace("{region}", region)
+                 # Scope the account field (catalog templates use ':*:') to the
+                 # deploying account — tfsec flags wildcarded accounts on
+                 # sensitive actions like logs:CreateLogGroup.
+                 .replace(":*:", ":${data.aws_caller_identity.current.account_id}:")
                 for a in raw_arns
             ]
             all_statements.append({

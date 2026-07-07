@@ -7,6 +7,11 @@
       "tool": "claude-code",
       "scope": "local",
       "modelSlug": "kimi-k-2-7-code"
+    },
+    {
+      "tool": "opencode",
+      "scope": "local",
+      "modelSlug": "kimi-k2.6"
     }
   ]
 }

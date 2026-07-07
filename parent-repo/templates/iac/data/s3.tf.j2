@@ -9,7 +9,6 @@ resource "aws_s3_bucket" "{{ pn }}_data" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-data"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

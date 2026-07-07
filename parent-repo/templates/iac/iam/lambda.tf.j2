@@ -14,7 +14,6 @@ resource "aws_iam_role" "lambda_exec" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-role"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -95,7 +94,7 @@ resource "aws_iam_role_policy" "lambda_kms" {
       Sid    = "KMSDecrypt"
       Effect = "Allow"
       Action = ["kms:Decrypt", "kms:GenerateDataKey"]
-      Resource = "arn:aws:kms:*:*:key/*"
+      Resource = module.kms.key_arn
     }]
   })
 }
@@ -262,7 +261,7 @@ resource "aws_iam_role_policy" "lambda_cognito" {
         "cognito-idp:AdminListGroupsForUser",
         "cognito-idp:ListUsers"
       ]
-      Resource = "arn:aws:cognito-idp:*:*:userpool/*"
+      Resource = module.cognito.user_pool_arn
     }]
   })
 }

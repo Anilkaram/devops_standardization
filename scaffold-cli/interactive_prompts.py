@@ -536,11 +536,27 @@ def _ask_compute(config: dict, dp: Path) -> dict:
                 ("lambda",      "Serverless. Best for event-driven, low-traffic, or prototype stage."),
                 ("ecs-fargate", "Containerised. Good balance of control and managed ops."),
                 ("eks",         "Kubernetes. Use when team has high ops maturity and large scale."),
+                ("ec2",         "Virtual machines. Full OS control. Good for stateful or legacy backends."),
+                ("none",        "No backend — static frontend only, or I'll define compute in infra.yaml."),
             ],
         )
         svcs = config.setdefault("services", [])
         if "static-site" not in svcs:
             svcs.append("static-site")
+        if backend == "none":
+            typer.secho(
+                "    No backend compute selected — generating the static frontend only.\n"
+                "    Add a compute service to infra.yaml later (e.g. ec2, lambda) to "
+                "generate the backend + CI/CD deploy stage.",
+                fg=typer.colors.YELLOW,
+            )
+            _log_and_echo(
+                "services.compute", "static-site (no backend)",
+                "interactive prompt",
+                f"{ptype} project generated frontend-only; user declined backend compute.",
+                decisions_path=dp,
+            )
+            return config
         if backend not in svcs:
             svcs.append(backend)
         if ptype == "chatbot" and "bedrock" not in svcs:
@@ -567,14 +583,27 @@ def _ask_compute(config: dict, dp: Path) -> dict:
             ("ecs-fargate", "Managed containers. No cluster ops. Good for most teams."),
             ("eks",         "Kubernetes. Use when you need advanced scheduling or high ops maturity."),
             ("ec2",         "Full control over VMs. Use only if ECS/EKS don't fit your use case."),
+            ("none",        "No compute here — I'll define it in infra.yaml, or this is a data-only stack."),
         ]
     else:
         options = [
             ("lambda",      "Serverless functions. Pay per invocation. Scales to zero."),
+            ("ec2",         "Virtual machines. Full OS control. Good for stateful or legacy apps."),
             ("ecs-fargate", "Containers with always-on capacity. Use if Lambda limits apply."),
+            ("none",        "No compute here — I'll define it in infra.yaml, or this is a data-only stack."),
         ]
 
     val = _prompt_choice("Which compute service?", options)
+    if val == "none":
+        typer.secho(
+            "    No compute selected. Note: a deployable stack needs a compute "
+            "target — add one to infra.yaml (e.g. ec2, lambda) if you want the "
+            "scaffold to generate compute + a CI/CD pipeline.",
+            fg=typer.colors.YELLOW,
+        )
+        _log_and_echo("services.compute", "none", "interactive prompt",
+                      "User declined a compute target at the prompt.", decisions_path=dp)
+        return config
     config.setdefault("services", []).append(val)
     _log_and_echo("services.compute", val, "interactive prompt",
                   "Primary compute target for this workload.", decisions_path=dp)
@@ -760,7 +789,9 @@ def is_config_complete(config: dict) -> bool:
     """
     COMPUTE = {"lambda", "ecs-fargate", "eks", "ec2", "static-site"}
     services    = config.get("services", [])
-    has_compute = any(s in COMPUTE for s in services)
+    # Support both list-of-strings and list-of-dicts (new schema with 'type' key)
+    service_types = [s["type"] if isinstance(s, dict) else s for s in services]
+    has_compute = any(s in COMPUTE for s in service_types)
     has_name    = bool(config.get("project", {}).get("name"))
     has_region  = bool(
         config.get("project", {}).get("region") or config.get("cloud", {}).get("region")

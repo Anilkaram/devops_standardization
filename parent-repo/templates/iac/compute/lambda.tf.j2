@@ -60,7 +60,6 @@ resource "aws_lambda_function" "app" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-func"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 
   depends_on = [aws_cloudwatch_log_group.lambda]
@@ -74,6 +73,5 @@ resource "aws_cloudwatch_log_group" "lambda" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-logs"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }

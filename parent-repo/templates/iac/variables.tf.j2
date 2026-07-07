@@ -9,11 +9,6 @@ variable "region" {
   default     = "{{ region }}"
 }
 
-variable "cost_centre" {
-  description = "Cost centre tag for billing attribution"
-  type        = string
-  default     = ""
-}
 
 variable "app_domain" {
   description = "Custom domain for the application (used in CORS and ACM certificates). Leave empty to use AWS-provided domains."

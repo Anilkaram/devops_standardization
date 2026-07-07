@@ -60,6 +60,5 @@ resource "aws_dynamodb_table" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-ddb"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }

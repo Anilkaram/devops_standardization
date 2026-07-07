@@ -1,0 +1,94 @@
+# EC2 Auto Scaling Group — launch template + ASG (aws provider ~> 6.0)
+# Launches hardened EC2 instances (IMDSv2, encrypted EBS) across private subnets.
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_launch_template" "app" {
+  name_prefix   = "{{ project_name }}-${var.environment}-lt-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.asg_instance_type
+
+  # IMDSv2 required — blocks IMDSv1 to prevent SSRF metadata theft
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  # Encrypted root volume
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      encrypted             = true
+      kms_key_id            = var.kms_key_arn
+      volume_type           = "gp3"
+      volume_size           = var.asg_root_volume_gb
+      delete_on_termination = true
+    }
+  }
+
+  vpc_security_group_ids = [var.security_group_id]
+
+  iam_instance_profile {
+    name = var.instance_profile_name
+  }
+
+  monitoring {
+    enabled = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "{{ project_name }}-${var.environment}-asg-instance"
+      Environment = var.environment
+    }
+  }
+}
+
+resource "aws_autoscaling_group" "app" {
+  name_prefix         = "{{ project_name }}-${var.environment}-asg-"
+  vpc_zone_identifier = var.private_subnet_ids
+  min_size            = var.asg_min_size
+  max_size            = var.asg_max_size
+  desired_capacity    = var.asg_desired_capacity
+
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  # Rolling instance refresh on launch-template change
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "{{ project_name }}-${var.environment}-asg"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "Environment"
+    value               = var.environment
+    propagate_at_launch = true
+  }
+}

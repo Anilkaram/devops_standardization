@@ -21,7 +21,6 @@ resource "aws_cloudwatch_event_rule" "ecr_push" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-ecr-push-rule"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% else %}
@@ -43,7 +42,6 @@ resource "aws_cloudwatch_event_bus" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-bus"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -60,7 +58,6 @@ resource "aws_cloudwatch_event_rule" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-rule"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}

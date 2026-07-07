@@ -9,20 +9,9 @@ locals {
   }
 }
 
-{% if 'cloudwatch' not in services %}
-# Application log group — used by compute templates via local.log_retention_days
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/app/{{ project_name }}-${var.environment}"
-  retention_in_days = lookup(local.log_retention_days, var.environment, 30)
-  kms_key_id        = try(aws_kms_key.main.arn, null)
-
-  tags = {
-    Name        = "{{ project_name }}-${var.environment}-app-logs"
-    Environment = var.environment
-    CostCentre  = var.cost_centre
-  }
-}
-{% endif %}
+{# Each compute module (lambda, ecs, ec2) creates and encrypts its own log
+   group. The former generic "/app/" log group was unreferenced dead
+   infrastructure, so it is intentionally not generated here. #}
 
 {% if 'cloudwatch' not in services and 'lambda' in compute_target %}
 # Lambda error-rate alarm
@@ -46,7 +35,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-errors"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -71,7 +59,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_throttles" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-throttles"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -96,7 +83,6 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-lambda-duration"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -122,7 +108,6 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-cpu-high"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -142,13 +127,12 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_description   = "API Gateway 5xx errors exceeded threshold"
 
   dimensions = {
-    ApiId = aws_apigatewayv2_api.main.id
+    ApiId = module.api_gateway.api_id
   }
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api-5xx"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}
@@ -174,7 +158,6 @@ resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-dlq-depth"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% endif %}

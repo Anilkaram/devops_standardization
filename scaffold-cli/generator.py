@@ -24,13 +24,14 @@ Output structure:
 Variables flow:
   variables.tf   declarations (name + type + description, no default)
   env/{env}/terraform.tfvars  actual values per environment
-    Base vars  : project_name, region, owner, environment, vpc_cidr, cost_centre
+    Base vars  : project_name, region, owner, environment, vpc_cidr
     Static vars: well-known per-service vars (eks_instance_type, db_instance_class)
     Dynamic vars: Claude API returns variables[] alongside terraform_hcl
 """
 
 from pathlib import Path
 from typing import Any
+import re
 import typer
 from jinja2 import Environment, FileSystemLoader
 
@@ -60,8 +61,6 @@ BASE_VARS: list[dict] = [
      "description": "Deployment environment (dev, staging, prod, uat)"},
     {"name": "vpc_cidr",     "type": "string",
      "description": "CIDR block for the VPC (e.g. 10.0.0.0/16)"},
-    {"name": "cost_centre",  "type": "string",
-     "description": "Cost centre code for billing and tagging"},
 ]
 
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -174,6 +173,14 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
         {"name": "alb_idle_timeout", "type": "number",
          "description": "ALB connection idle timeout in seconds",
          "dev": 60, "staging": 60, "prod": 60},
+        {"name": "alb_certificate_arn", "type": "string",
+         "description": "ACM certificate ARN for the HTTPS listener (TLS 1.2+)",
+         "dev": "REPLACE_WITH_ACM_CERT_ARN", "staging": "REPLACE_WITH_ACM_CERT_ARN",
+         "prod": "REPLACE_WITH_ACM_CERT_ARN"},
+        {"name": "alb_access_logs_bucket", "type": "string",
+         "description": "S3 bucket name for ALB access logs",
+         "dev": "REPLACE_WITH_LOG_BUCKET", "staging": "REPLACE_WITH_LOG_BUCKET",
+         "prod": "REPLACE_WITH_LOG_BUCKET"},
     ],
     "opensearch": [
         {"name": "opensearch_instance_type",  "type": "string",
@@ -224,6 +231,9 @@ def _implicit_connections(services: list, compute_target: str) -> set:
     conns = set()
     if "eventbridge" in s and "sqs" in s:
         conns.add("eventbridge->sqs")
+    if not compute_target:
+        # Compute-less stack (static site / data-only): no compute→store edges.
+        return conns
     if "eventbridge" in s and "sqs" not in s and compute_target == "lambda":
         conns.add("eventbridge->lambda")
     if "sqs" in s and compute_target == "lambda":
@@ -239,6 +249,18 @@ def _implicit_connections(services: list, compute_target: str) -> set:
         if store in s:
             conns.add(f"{compute_target}->{store}")
     return conns
+
+
+# """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+# Catalog entry lookup — supports role-suffixed service names (ec2-java → ec2)
+# """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+def _catalog_entry(catalog_services: dict, svc: str) -> dict:
+    """Return the catalog entry for *svc*, falling back to base name for suffixed names."""
+    if svc in catalog_services:
+        return catalog_services[svc]
+    base = dg._base_svc(svc, {"services": catalog_services})
+    return catalog_services.get(base, {}) if base else {}
 
 
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -310,10 +332,12 @@ def generate_scaffold(
     env_names    = list(environments.keys()) if environments else ["dev", "staging", "prod"]
 
     # "" Resolve services from catalog """"""""""""""""""""""""""""""""""""""
-    compute_service_names = dg.get_compute_services(catalog)
-    compute_list          = [s for s in services if s in compute_service_names]
-    compute_target        = compute_list[0]
-    other_services        = [s for s in services if s not in compute_service_names]
+    # compute_target is "" (empty) for compute-less stacks (static site / data-only).
+    # Empty string keeps Jinja `'x' in compute_target` checks safe (unlike None).
+    compute_list   = dg.resolve_compute_services(services, catalog)
+    compute_target = compute_list[0] if compute_list else ""
+    compute_set    = set(compute_list)
+    other_services = [s for s in services if s not in compute_set]
 
     catalog_services = catalog.get("services", {})
     ingress_svcs     = {
@@ -352,11 +376,29 @@ def generate_scaffold(
     # services don't leave orphan files. Keep fixed-name files managed elsewhere.
     _FIXED_TF_FILES = {
         "provider.tf", "networking.tf", "main.tf", "iam.tf",
-        "observability.tf", "output.tf", "variables.tf",
+        "observability.tf", "output.tf", "variables.tf", "security.tf",
     }
     for tf_file in base.glob("*.tf"):
         if tf_file.name not in _FIXED_TF_FILES:
-            tf_file.unlink()  # removes stale service files AND the old data.tf
+            tf_file.unlink()
+
+    # Clean up stale module directories — remove any modules/ subdir whose name
+    # does NOT correspond to a service in the current run.  This prevents old
+    # s3_java/ s3_php/ directories from lingering after S3 is consolidated.
+    _modules_dir = base / "modules"
+    if _modules_dir.exists():
+        import shutil
+        # Build set of module dir names the current run will write
+        _expected_mods: set[str] = set()
+        for _svc in services:
+            _svc_base = dg._base_svc(_svc, catalog) or _svc
+            if _svc_base in {"s3"}:                     # consolidated → base name only
+                _expected_mods.add(_svc_base.replace("-", "_"))
+            else:
+                _expected_mods.add(_svc.replace("-", "_"))
+        for _mod_dir in _modules_dir.iterdir():
+            if _mod_dir.is_dir() and _mod_dir.name not in _expected_mods:
+                shutil.rmtree(_mod_dir)
 
     # modules/ -- one sub-folder per local reusable module
     _write_modules_scaffold(base, services)
@@ -396,8 +438,12 @@ def generate_scaffold(
     dynamic_vars: list[dict] = []
 
     for svc in compute_list + list(other_services):
-        if svc in STATIC_SERVICE_VARS:
-            dynamic_vars.extend(STATIC_SERVICE_VARS[svc])
+        # Support both exact names ('eks') and role-suffixed names ('ec2-java')
+        lookup_key = svc if svc in STATIC_SERVICE_VARS else (
+            dg._base_svc(svc, catalog) or svc
+        )
+        if lookup_key in STATIC_SERVICE_VARS:
+            dynamic_vars.extend(STATIC_SERVICE_VARS[lookup_key])
 
     # "" provider.tf """""""""""""""""""""""""""""""""""""""""""""""""""""""
     _write_provider_tf(base, project_name, region, owner, catalog)
@@ -406,6 +452,12 @@ def generate_scaffold(
     vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
     (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
     typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+
+    # "" security.tf (shared app security group + optional EC2 instance profile) ""
+    # Many modules (alb, ec2, autoscaling, rds, ...) need a shared security group
+    # and EC2 instances need an instance profile. Create them once at root and pass
+    # them into the modules as inputs.
+    _write_shared_glue(base, services, compute_list)
 
     # "" main.tf (compute) " from catalog templates """""""""""""""""""""""""
     compute_templates = []
@@ -418,11 +470,12 @@ def generate_scaffold(
     rendered_hcl: dict[str, str] = {}
 
     for c in compute_list:
-        entry    = catalog_services.get(c, {})
+        entry    = _catalog_entry(catalog_services, c)
         template = entry.get("template")
-        if c in _MODULE_MAIN_HCL:
+        _hcl_key = c if c in _MODULE_MAIN_HCL else (dg._base_svc(c, catalog) or c)
+        if _hcl_key in _MODULE_MAIN_HCL:
             # Hardened static template takes priority — guaranteed Checkov compliance
-            rendered_hcl[c] = _MODULE_MAIN_HCL[c]
+            rendered_hcl[c] = _MODULE_MAIN_HCL[_hcl_key]
         elif template:
             compute_templates.append(template)
             compute_labels.append(c)
@@ -436,12 +489,15 @@ def generate_scaffold(
                 rendered_hcl[c] = hcl
                 dynamic_vars.extend(svc_vars)
 
-    # Append ingress add-ons that apply to the current compute targets
+    # Append ingress add-ons that apply to the current targets.
+    # valid_compute_targets may include non-compute backends (s3, static-site) —
+    # e.g. CloudFront can front an S3 bucket with no compute at all. So match
+    # against ALL services, not just compute_list.
     for ingress_svc, i_entry in ingress_svcs.items():
         if ingress_svc not in services:
             continue
         allowed = set(i_entry.get("valid_compute_targets", []))
-        if not any(c in allowed for c in compute_list):
+        if not (allowed & set(services)):
             continue
         i_template = i_entry.get("template")
         if i_template:
@@ -463,7 +519,17 @@ def generate_scaffold(
         mod_name = _SVC_TO_MODULE.get(svc, svc.replace("-", "_"))
         svc_var_names = [v["name"] for v in dynamic_vars if v.get("service") == svc]
         _write_module_dir(modules_dir, mod_name, hcl, svc_var_names)
-        call = _module_call_block(mod_name, svc_var_names)
+        typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
+                    fg=typer.colors.GREEN)
+
+        # Resolve base type — plain 'ec2' has no suffix so _base_svc returns None
+        svc_base = dg._base_svc(svc, catalog) or svc
+        if svc_base == "ec2":
+            # EC2 (plain or role-suffixed) — each instance gets its own prefixed sizing vars
+            call = _ec2_module_call_block(mod_name)
+            _inject_ec2_instance_vars(svc, mod_name, environments, dynamic_vars)
+        else:
+            call = _module_call_block(mod_name, svc_var_names)
 
         # Wire cross-module connections: pass outputs from upstream modules as inputs
         call = _inject_connection_wiring(call, mod_name, services, connections)
@@ -513,7 +579,13 @@ def generate_scaffold(
             )
 
     if iam_blocks:
-        (base / "iam.tf").write_text("\n".join(iam_blocks) + "\n", encoding="utf-8")
+        iam_content = "\n".join(iam_blocks) + "\n"
+        # Policies scope ARNs to the deploying account via aws_caller_identity;
+        # declare the data source once at root if no block already does.
+        if ("data.aws_caller_identity.current" in iam_content
+                and 'data "aws_caller_identity" "current"' not in iam_content):
+            iam_content = 'data "aws_caller_identity" "current" {}\n\n' + iam_content
+        (base / "iam.tf").write_text(iam_content, encoding="utf-8")
 
     # "" Per-service modules (each service → modules/<svc>/{main,variables,outputs}.tf) ""
     # Root main.tf gets a module call block for each service.
@@ -523,11 +595,29 @@ def generate_scaffold(
     service_module_calls: list[str] = []   # collected → appended to root main.tf
     wrote_any_service = False
 
+    # Services where multiple role-suffixed instances share ONE consolidated module.
+    # e.g. s3-java, s3-php, s3-doc, s3-ui → single modules/s3/ with for_each over buckets map.
+    _CONSOLIDATE_BASES: set[str] = {"s3"}
+    _consolidated_written: set[str] = set()   # track which base modules already written
+
     for svc in other_services:
         if svc in ingress_keys:
             continue
 
-        entry    = catalog_services.get(svc, {})
+        svc_base = dg._base_svc(svc, catalog) or svc
+
+        # ── Consolidated module (all s3-* → one modules/s3/) ────────────────────
+        if svc_base in _CONSOLIDATE_BASES:
+            if svc_base not in _consolidated_written:
+                _consolidated_written.add(svc_base)
+                _write_service_module(modules_dir, svc_base, "")
+                service_module_calls.append(_service_module_call(svc_base))
+                # Build s3_buckets map from all role-suffixed s3 services
+                _inject_s3_buckets_var(svc_base, other_services, project_name, environments, dynamic_vars)
+                wrote_any_service = True
+            continue   # skip per-instance module creation
+
+        entry    = _catalog_entry(catalog_services, svc)
         template = entry.get("template")
 
         if template:
@@ -535,18 +625,19 @@ def generate_scaffold(
             merged     = {**ctx, **extra_vars}
             try:
                 hcl = jinja_env.get_template(template).render(**merged)
-                _write_service_module(modules_dir, svc, hcl)
-                service_module_calls.append(_service_module_call(svc))
+                auto_vars = _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc, auto_vars))
                 wrote_any_service = True
             except Exception as e:
                 typer.secho(f"  ! failed {svc} ({template}): {e}", fg=typer.colors.YELLOW)
         else:
-            fallback_entry = entry if svc in catalog_services else {
+            has_base = bool(entry)  # truthy when base-name lookup succeeded
+            fallback_entry = entry if has_base else {
                 "terraform_resource": f"aws_{svc.replace('-', '_')}",
                 "category": "unknown",
                 "iam_actions": [],
             }
-            if svc not in catalog_services:
+            if not has_base:
                 typer.secho(
                     f"  ~ '{svc}' not in catalog -- attempting AI generation...",
                     fg=typer.colors.BLUE,
@@ -557,8 +648,8 @@ def generate_scaffold(
             )
             if result:
                 hcl, svc_vars = result
-                _write_service_module(modules_dir, svc, hcl)
-                service_module_calls.append(_service_module_call(svc))
+                auto_vars = _write_service_module(modules_dir, svc, hcl)
+                service_module_calls.append(_service_module_call(svc, auto_vars))
                 typer.secho(f"  + modules/{svc.replace('-','_')}/  [ai-generated]",
                             fg=typer.colors.CYAN)
                 dynamic_vars.extend(svc_vars)
@@ -577,18 +668,11 @@ def generate_scaffold(
                 if not any(d["name"] == v["name"] for d in dynamic_vars):
                     dynamic_vars.append(v)
 
-    # Auto-add kms module when KMS is needed but not explicitly listed
-    if wrote_any_service and "kms" not in services:
-        kms_entry    = catalog_services.get("kms", {})
-        kms_template = kms_entry.get("template")
-        if kms_template:
-            try:
-                hcl = jinja_env.get_template(kms_template).render(**ctx)
-                _write_service_module(modules_dir, "kms", hcl)
-                service_module_calls.append(_service_module_call("kms"))
-                typer.secho("  + modules/kms/  [auto-added]", fg=typer.colors.GREEN)
-            except Exception as e:
-                typer.secho(f"  ! failed kms: {e}", fg=typer.colors.YELLOW)
+    # NOTE: KMS is no longer auto-added. The scaffold generates only the services
+    # listed in infra.yaml. Module calls that reference an absent module (e.g.
+    # try(module.kms.key_arn, null)) are pruned to `null` below, so encryption
+    # falls back to service-managed keys (e.g. S3 SSE-AES256) unless the user
+    # explicitly lists `kms`.
 
     # Append service module calls to root main.tf
     if service_module_calls:
@@ -612,6 +696,13 @@ def generate_scaffold(
     # "" locals.tf " cross-module ARN resolution """""""""""""""""""""""""""""
     _write_locals_tf(base, project_name, services, connections)
 
+    # Prune references to modules that were never generated, so the stack contains
+    # only what infra.yaml asked for. `try(module.X.attr, null)` -> `null` when X
+    # is absent (Terraform errors on undeclared-module references even inside try()).
+    # Runs after every root-level .tf file has been written.
+    for _tf in base.glob("*.tf"):
+        _prune_absent_module_refs(_tf, modules_dir)
+
     # "" env/{env}/ " backend.tf, terraform.tfvars, terraform.tfvars.example
     _write_env_files(base, project_name, region, owner, environments or {}, dynamic_vars, services)
 
@@ -627,8 +718,21 @@ def generate_scaffold(
     # ── cost-estimate.md ──────────────────────────────────────────────────────
     _write_cost_estimate(base, project_name, services, environments or {})
 
+    # ── README.md + Makefile — how to run terraform per environment ───────────
+    _write_run_readme(base, project_name, env_names)
+
     typer.secho("\n> Scaffold complete.", fg=typer.colors.GREEN, bold=True)
     typer.echo(f"  Output: {base.absolute()}")
+    _first_env = env_names[0] if env_names else "dev"
+    typer.secho(
+        f"  Run terraform per environment (vars live in env/<env>/ — Terraform does\n"
+        f"  NOT auto-load them, so pass -var-file):\n"
+        f"    terraform init -backend=false        # local; or: copy env/{_first_env}/backend.tf to ./backend.tf\n"
+        f"    terraform plan  -var-file=env/{_first_env}/terraform.tfvars\n"
+        f"    terraform apply -var-file=env/{_first_env}/terraform.tfvars\n"
+        f"  (or use the generated Makefile: make plan ENV={_first_env})",
+        fg=typer.colors.CYAN,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -639,6 +743,14 @@ def generate_scaffold(
 # Format: var_name -> (type, description, rhs_in_root_call)
 # rhs_in_root_call is the Terraform expression used in the root main.tf module call.
 _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
+    "alb": [
+        ("environment",            "string",       "var.environment"),
+        ("vpc_id",                 "string",       "module.vpc.vpc_id"),
+        ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
+        ("security_group_id",      "string",       "aws_security_group.app.id"),
+        ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
+        ("alb_access_logs_bucket", "string",       "var.alb_access_logs_bucket"),
+    ],
     "lambda": [
         ("name_prefix",          "string",      '"${var.project_name}-${var.environment}"'),
         # Deployment package
@@ -653,12 +765,11 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("log_retention_days",      "number",      "var.log_retention_days"),
         # Optional service module outputs passed in when those services are present
         ("secrets_manager_arn",     "string",      'try(module.secrets_manager.secret_arn, null)'),
-        ("sns_topic_arn",           "string",      'try(module.sns.topic_arn, null)'),
-        ("sqs_queue_url",           "string",      'try(module.sqs.queue_url, null)'),
+        ("sns_topic_arn",           "string",      "null"),
+        ("sqs_queue_url",           "string",      "null"),
         # Universal
         ("environment",             "string",      "var.environment"),
         ("region",                  "string",      "var.region"),
-        ("cost_centre",             "string",      "var.cost_centre"),
         ("tags",                    "map(string)", "local.common_tags"),
     ],
     "eks": [
@@ -673,18 +784,16 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         # Cross-module deps — live in root networking.tf (module.vpc)
         ("subnet_private_ids",    "list(string)", "module.vpc.private_subnets"),
         ("subnet_public_ids",     "list(string)", "module.vpc.public_subnets"),
-        ("security_group_id",     "string",       "aws_security_group.app.id"),
+        ("security_group_id",     "string",       "null"),
         # Universal
         ("environment",           "string",       "var.environment"),
         ("region",                "string",       "var.region"),
-        ("cost_centre",           "string",       "var.cost_centre"),
         ("tags",                  "map(string)",  "local.common_tags"),
     ],
     "ecs": [
         ("name_prefix",   "string",      '"${var.project_name}-${var.environment}"'),
         ("environment",   "string",      "var.environment"),
         ("region",        "string",      "var.region"),
-        ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
     ],
     "rds": [
@@ -693,8 +802,27 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("db_username",   "string",      "var.db_username"),
         ("environment",   "string",      "var.environment"),
         ("region",        "string",      "var.region"),
-        ("cost_centre",   "string",      "var.cost_centre"),
         ("tags",          "map(string)", "local.common_tags"),
+    ],
+    # ec2 sizing vars are prefixed per-instance at call-site (var.ec2_java_instance_type)
+    # so the RHS here is filled by _ec2_module_call_block at runtime.
+    "ec2": [
+        ("name_prefix",           "string",       ""),           # computed from mod_name
+        ("instance_type",         "string",       ""),           # prefixed var
+        ("ami_id",                "string",       ""),           # prefixed var
+        ("subnet_id",             "string",       "module.vpc.private_subnets[0]"),
+        ("security_group_id",     "string",       "aws_security_group.app.id"),
+        ("kms_key_arn",           "string",       "try(module.kms.key_arn, null)"),
+        ("instance_profile_name", "string",       'try(aws_iam_instance_profile.ec2.name, null)'),
+        ("tags",                  "map(string)",  "local.common_tags"),
+    ],
+    "api_gateway": [
+        ("environment",          "string", "var.environment"),
+        ("app_domain",           "string", '""'),
+        ("log_retention_days",   "number", "var.log_retention_days"),
+        ("kms_key_arn",          "string", "try(module.kms.key_arn, null)"),
+        ("lambda_invoke_arn",    "string", "module.lambda.invoke_arn"),
+        ("lambda_function_name", "string", "module.lambda.function_name"),
     ],
 }
 
@@ -719,6 +847,7 @@ _SVC_TO_MODULE: dict[str, str] = {
     "ecs-fargate": "ecs",
     "rds":         "rds",
     "aurora":      "rds",
+    "api-gateway": "api_gateway",
 }
 
 
@@ -741,9 +870,14 @@ def _write_module_dir(
     (mod_dir / "main.tf").write_text(header + resource_hcl, encoding="utf-8")
 
     # variables.tf -- use pre-written vars if this module has a static _MODULE_VARS_TF entry
-    if mod_name in _MODULE_VARS_TF:
-        (mod_dir / "variables.tf").write_text(_MODULE_VARS_TF[mod_name], encoding="utf-8")
-        outputs_hcl = _MODULE_OUTPUTS_TF.get(mod_name, f"# Add outputs for the {mod_name} module.\n")
+    # Support role-suffixed module names (ec2_java → look up ec2)
+    _vars_key = mod_name if mod_name in _MODULE_VARS_TF else (
+        dg._base_svc(mod_name.replace("_", "-"), {"services": {k: {} for k in _MODULE_VARS_TF}})
+        or mod_name
+    )
+    if _vars_key in _MODULE_VARS_TF:
+        (mod_dir / "variables.tf").write_text(_MODULE_VARS_TF[_vars_key], encoding="utf-8")
+        outputs_hcl = _MODULE_OUTPUTS_TF.get(_vars_key, f"# Add outputs for the {mod_name} module.\n")
         (mod_dir / "outputs.tf").write_text(outputs_hcl, encoding="utf-8")
         return
 
@@ -880,8 +1014,8 @@ def _inject_connection_wiring(call_block: str, mod_name: str,
     # Cognito wiring: if cognito is in services, api_gateway needs its outputs
     STATIC_WIRES: list[tuple[str, list[str]]] = [
         ("api_gateway", "cognito", [
-            '  cognito_client_id     = aws_cognito_user_pool_client.app.id',
-            '  cognito_issuer_url    = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.main.id}"',
+            '  cognito_client_id     = module.cognito.client_id',
+            '  cognito_issuer_url    = "https://cognito-idp.${var.region}.amazonaws.com/${module.cognito.user_pool_id}"',
         ]),
     ]
 
@@ -905,9 +1039,138 @@ def _inject_connection_wiring(call_block: str, mod_name: str,
     if not extra_lines:
         return call_block
 
-    # Insert extra_lines before the closing }
+    # Insert extra_lines before the closing }, skipping any that define a var already set
+    import re
     block_lines = call_block.rstrip().split("\n")
-    return "\n".join(block_lines[:-1] + extra_lines + [block_lines[-1]]) + "\n"
+    # Extract variable names already present in the block (e.g. "lambda_invoke_arn" from "  lambda_invoke_arn = ...")
+    existing_vars = set()
+    for line in block_lines:
+        m = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=', line)
+        if m:
+            existing_vars.add(m.group(1))
+    new_lines = []
+    for ln in extra_lines:
+        m = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=', ln)
+        if m and m.group(1) in existing_vars:
+            continue
+        new_lines.append(ln)
+    if not new_lines:
+        return call_block
+    return "\n".join(block_lines[:-1] + new_lines + [block_lines[-1]]) + "\n"
+
+
+def _inject_s3_buckets_var(
+    base: str,
+    all_services: list[str],
+    project_name: str,
+    environments: dict,
+    dynamic_vars: list[dict],
+) -> None:
+    """Build the s3_buckets map(object) variable from all role-suffixed s3 services.
+
+    Each svc like 's3-java' → bucket key 'java' in the map.
+    Per-env bucket names include the environment suffix.
+    Reads lifecycle_days and versioning from environments config if present.
+    """
+    roles = [
+        svc.split("-", 1)[1]
+        for svc in all_services
+        if dg._base_svc(svc, {"services": {base: {}}}) == base
+    ]
+    if not roles:
+        return
+
+    # Build one var dict per environment — stored as an obj_block (not a scalar)
+    # We store it as a special type "s3_map" that the tfvars writer renders as HCL block
+    env_defaults: dict[str, dict] = {}
+    for env_name, env_cfg in environments.items():
+        role_cfgs: dict[str, dict] = {}
+        for role in roles:
+            svc_cfg = env_cfg.get(f"{base}-{role}", {})
+            role_cfgs[role] = {
+                "name":           f"{project_name}-{env_name}-{role}",
+                "versioning":     svc_cfg.get("versioning", True),
+                "lifecycle_days": svc_cfg.get("lifecycle_days", 90),
+                "force_destroy":  svc_cfg.get("force_destroy", False),
+            }
+        env_defaults[env_name] = role_cfgs
+
+    var: dict = {
+        "name":        "s3_buckets",
+        "type":        "s3_map",        # sentinel: rendered as HCL map block by tfvars writer
+        "description": f"Map of S3 buckets ({', '.join(roles)}). Key = role, value = bucket config.",
+        "_env_values": env_defaults,    # private key used by tfvars writer
+    }
+    if not any(d["name"] == "s3_buckets" for d in dynamic_vars):
+        dynamic_vars.append(var)
+
+
+def _ec2_module_call_block(mod_name: str) -> str:
+    """Generate root main.tf module call for a role-suffixed EC2 fleet.
+
+    Each fleet (ec2_java, ec2_php, ec2_doc) gets its own prefixed sizing variables
+    so all three can coexist in the same tfvars file without collision:
+      ec2_java_instance_type = "t3.medium"
+      ec2_php_instance_type  = "t3.medium"
+      ec2_doc_instance_type  = "t3.small"
+    """
+    # Extract role label (java / php / doc) from mod_name like "ec2_java"
+    parts = mod_name.split("_", 1)
+    role = parts[1] if len(parts) == 2 else mod_name
+    return (
+        f'module "{mod_name}" {{\n'
+        f'  source = "./modules/{mod_name}"\n'
+        f'\n'
+        f'  name_prefix           = "${{var.project_name}}-${{var.environment}}-{role}"\n'
+        f'  instance_type         = var.{mod_name}_instance_type\n'
+        f'  ami_id                = var.{mod_name}_ami_id\n'
+        f'  subnet_id             = module.vpc.private_subnets[0]\n'
+        f'  security_group_id     = aws_security_group.app.id\n'
+        f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
+        f'  instance_profile_name = try(aws_iam_instance_profile.ec2.name, null)\n'
+        f'  tags                  = local.common_tags\n'
+        f'}}\n'
+    )
+
+
+def _inject_ec2_instance_vars(
+    svc: str,
+    mod_name: str,
+    environments: dict,
+    dynamic_vars: list[dict],
+) -> None:
+    """Append per-instance sizing variables for a role-suffixed EC2 service.
+
+    Reads instance_type from environments.<env>.<svc>.instance_type and
+    appends prefixed variable dicts (ec2_java_instance_type etc.) to dynamic_vars
+    so they are written to both root variables.tf and each env's terraform.tfvars.
+    """
+    # Determine per-env instance_type values from environments config
+    env_types: dict[str, str] = {}
+    for env_name, env_cfg in environments.items():
+        svc_cfg = env_cfg.get(svc, {})
+        env_types[env_name] = svc_cfg.get("instance_type", "t3.medium")
+
+    # instance_type var
+    instance_type_var: dict = {
+        "name": f"{mod_name}_instance_type",
+        "type": "string",
+        "description": f"EC2 instance type for the {svc} fleet",
+    }
+    instance_type_var.update(env_types)  # adds dev/prod/staging keys
+
+    # ami_id var — always a placeholder (AMI IDs are region/account specific)
+    ami_id_var: dict = {
+        "name": f"{mod_name}_ami_id",
+        "type": "string",
+        "description": f"AMI ID for the {svc} fleet (e.g. latest Amazon Linux 2023)",
+    }
+    for env_name in environments:
+        ami_id_var[env_name] = "REPLACE_WITH_AMI_ID"
+
+    for v in (instance_type_var, ami_id_var):
+        if not any(d["name"] == v["name"] for d in dynamic_vars):
+            dynamic_vars.append(v)
 
 
 def _module_call_block(mod_name: str, svc_var_names: list[str]) -> str:
@@ -958,7 +1221,7 @@ _MODULE_MAIN_HCL: dict[str, str] = {
     "lambda": '''\
 resource "aws_lambda_function" "app" {
   #checkov:skip=CKV_AWS_272:code_signing_config_arn requires a pre-created signing profile — set var.code_signing_config_arn when ready
-  function_name = "${local.name_prefix}-func"
+  function_name = "${var.name_prefix}-func"
   role          = var.lambda_exec_role_arn
 
   s3_bucket = var.lambda_s3_bucket
@@ -1005,29 +1268,33 @@ resource "aws_lambda_function" "app" {
     }
   }
 
-  tags = local.common_tags
+  tags = var.tags
 
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${local.name_prefix}-func"
+  #checkov:skip=CKV_AWS_338:Retention is environment-driven via var.log_retention_days (365 in prod tfvars)
+  name              = "/aws/lambda/${var.name_prefix}-func"
   retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
 
-  tags = local.common_tags
+  tags = var.tags
 }
 ''',
 
     "eks": '''\
 resource "aws_eks_cluster" "main" {
-  name     = "${local.name_prefix}-eks"
+  name     = "${var.name_prefix}-eks"
   role_arn = var.eks_cluster_role_arn
   version  = var.eks_cluster_version
 
   vpc_config {
     subnet_ids              = concat(var.subnet_private_ids, var.subnet_public_ids)
     endpoint_private_access = true
+    # Public endpoint only outside prod (kubectl access for dev teams); prod is private-only.
+    #tfsec:ignore:aws-eks-no-public-cluster-access
+    #tfsec:ignore:aws-eks-no-public-cluster-access-to-cidr
     endpoint_public_access  = var.environment != "prod"
     public_access_cidrs     = var.eks_public_access_cidrs
     security_group_ids      = compact([var.security_group_id])
@@ -1056,12 +1323,12 @@ resource "aws_eks_cluster" "main" {
     support_type = "EXTENDED"
   }
 
-  tags = local.common_tags
+  tags = var.tags
 }
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${local.name_prefix}-ng"
+  node_group_name = "${var.name_prefix}-ng"
   node_role_arn   = var.eks_node_role_arn
   subnet_ids      = var.subnet_private_ids
 
@@ -1086,7 +1353,7 @@ resource "aws_eks_node_group" "main" {
     NodeGroup   = "main"
   }
 
-  tags = local.common_tags
+  tags = var.tags
 }
 ''',
 
@@ -1376,7 +1643,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 
   dimensions = { FunctionName = each.value.name }
 
-  alarm_actions = [var.sns_topic_arn]
+  alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
 }
 
 resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
@@ -1395,7 +1662,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
 
   dimensions = { QueueName = each.value.name }
 
-  alarm_actions = [var.sns_topic_arn]
+  alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
 }
 
 resource "aws_cloudwatch_dashboard" "main" {
@@ -1403,10 +1670,232 @@ resource "aws_cloudwatch_dashboard" "main" {
   dashboard_body = jsonencode(var.dashboard.body)
 }
 ''',
+
+    "s3": '''\
+resource "aws_s3_bucket" "this" {
+  #checkov:skip=CKV_AWS_144:Cross-region replication is optional — enable per bucket after scaffold
+  #checkov:skip=CKV2_AWS_62:Event notifications are optional and should be configured post-scaffold
+  for_each      = var.buckets
+  bucket        = each.value.name
+  force_destroy = each.value.force_destroy
+
+  tags = merge(var.tags, { Role = each.key })
+}
+
+resource "aws_s3_bucket_versioning" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
+      kms_master_key_id = var.kms_key_arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Access logging — each bucket logs to the designated logging bucket
+resource "aws_s3_bucket_logging" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  target_bucket = var.logging_bucket_id != null ? var.logging_bucket_id : aws_s3_bucket.this[each.key].id
+  target_prefix = "s3-access-logs/${each.key}/"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  for_each = var.buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  rule {
+    id     = "abort-incomplete-multipart"
+    status = "Enabled"
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
+    id     = "expire-old-objects"
+    status = each.value.lifecycle_days > 0 ? "Enabled" : "Disabled"
+
+    expiration {
+      days = each.value.lifecycle_days > 0 ? each.value.lifecycle_days : 365
+    }
+  }
+}
+''',
+
+    "ec2": '''\
+#checkov:skip=CKV_TF_1:Registry source uses semver pin; git commit hash format not supported for Terraform Registry modules
+
+module "ec2_instance" {
+  #checkov:skip=CKV_TF_1:Registry source uses semver pin; git commit hash format not supported for Terraform Registry modules
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "~> 6.0"
+
+  name          = var.name_prefix
+  instance_type = var.instance_type
+  ami           = var.ami_id
+  key_name      = var.key_name
+
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = [var.security_group_id]
+
+  # IMDSv2 required — disables IMDSv1 to prevent SSRF-based metadata access
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  # EBS root volume — encrypted with CMK (module v6 takes an object, not a list)
+  root_block_device = {
+    encrypted   = true
+    kms_key_id  = var.kms_key_arn
+    volume_type = "gp3"
+    volume_size = var.root_volume_size_gb
+  }
+
+  # IAM instance profile for S3/RDS/Secrets access (created in security.tf)
+  create_iam_instance_profile = false
+  iam_instance_profile        = var.instance_profile_name
+
+  # Monitoring
+  monitoring = true
+
+  tags = var.tags
+}
+''',
 }
 
 # variables.tf content for each service module (map(object) typed)
 _MODULE_VARS_TF: dict[str, str] = {
+    "autoscaling": '''\
+variable "asg_instance_type" {
+  type        = string
+  description = "EC2 instance type for the Auto Scaling Group."
+  default     = "t3.medium"
+}
+
+variable "asg_root_volume_gb" {
+  type        = number
+  description = "Root EBS volume size in GB."
+  default     = 20
+}
+
+variable "asg_min_size" {
+  type        = number
+  description = "Minimum number of instances in the ASG."
+  default     = 2
+}
+
+variable "asg_max_size" {
+  type        = number
+  description = "Maximum number of instances in the ASG."
+  default     = 6
+}
+
+variable "asg_desired_capacity" {
+  type        = number
+  description = "Desired number of instances in the ASG."
+  default     = 2
+}
+
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+
+
+variable "private_subnet_ids" {
+  type        = list(string)
+  description = "Private subnet IDs the ASG launches instances into."
+}
+
+variable "security_group_id" {
+  type        = string
+  description = "Security group ID attached to ASG instances."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for EBS root volume encryption. null = AWS-managed."
+  default     = null
+}
+
+variable "instance_profile_name" {
+  type        = string
+  description = "IAM instance profile name attached to ASG instances."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+    "rds": '''\
+variable "environment"        { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "security_group_id"  { type = string }
+
+variable "multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+    "mysql": '''\
+variable "environment"        { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "security_group_id"  { type = string }
+
+variable "multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
     "lambda": '''\
 variable "name_prefix" { type = string }
 variable "lambda_s3_bucket" { type = string }
@@ -1417,13 +1906,24 @@ variable "lambda_exec_role_arn" { type = string }
 variable "log_retention_days" { type = number }
 variable "environment" { type = string }
 variable "region" { type = string }
-variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
-variable "kms_key_arn" { type = string; default = null }
-variable "secrets_manager_arn" { type = string; default = null }
-variable "sns_topic_arn" { type = string; default = null }
-variable "sqs_queue_url" { type = string; default = null }
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+variable "secrets_manager_arn" {
+  type    = string
+  default = null
+}
+variable "sns_topic_arn" {
+  type    = string
+  default = null
+}
+variable "sqs_queue_url" {
+  type    = string
+  default = null
+}
 variable "dlq_arn" {
   description = "ARN of the Dead Letter Queue for failed Lambda invocations."
   type        = string
@@ -1434,7 +1934,10 @@ variable "subnet_private_ids" {
   type        = list(string)
   default     = []
 }
-variable "security_group_id" { type = string; default = null }
+variable "security_group_id" {
+  type    = string
+  default = null
+}
 variable "reserved_concurrency" {
   description = "Reserved concurrent executions (-1 = unrestricted)."
   type        = number
@@ -1453,11 +1956,16 @@ variable "subnet_private_ids" { type = list(string) }
 variable "subnet_public_ids" { type = list(string) }
 variable "environment" { type = string }
 variable "region" { type = string }
-variable "cost_centre" { type = string }
 variable "tags" { type = map(string) }
 
-variable "kms_key_arn" { type = string; default = null }
-variable "security_group_id" { type = string; default = null }
+variable "kms_key_arn" {
+  type    = string
+  default = null
+}
+variable "security_group_id" {
+  type    = string
+  default = null
+}
 variable "eks_public_access_cidrs" {
   description = "CIDR blocks allowed to reach the EKS public API endpoint."
   type        = list(string)
@@ -1692,6 +2200,139 @@ variable "tags" {
   default = {}
 }
 ''',
+
+    "s3": '''\
+variable "buckets" {
+  type = map(object({
+    name           = string
+    versioning     = bool
+    lifecycle_days = number
+    force_destroy  = bool
+  }))
+  description = "Map of S3 buckets. Key = role label (java, php, doc, ui). Each entry creates one bucket."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for SSE-KMS encryption. null = AES256 (server-managed)."
+  default     = null
+}
+
+variable "logging_bucket_id" {
+  type        = string
+  description = "S3 bucket ID to receive access logs. null = each bucket logs to itself."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "ec2": '''\
+variable "name_prefix" {
+  type        = string
+  description = "Name prefix for the EC2 instance."
+}
+
+variable "instance_type" {
+  type        = string
+  description = "EC2 instance type (e.g. t3.medium, m5.large)."
+}
+
+variable "ami_id" {
+  type        = string
+  description = "AMI ID for the EC2 instance."
+}
+
+variable "key_name" {
+  type        = string
+  description = "EC2 key pair name for SSH access."
+  default     = null
+}
+
+variable "subnet_id" {
+  type        = string
+  description = "Subnet ID to launch the instance into (private subnet recommended)."
+}
+
+variable "security_group_id" {
+  type        = string
+  description = "Security group ID to attach to the instance."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for EBS root volume encryption."
+  default     = null
+}
+
+variable "root_volume_size_gb" {
+  type        = number
+  description = "Size of the root EBS volume in GB."
+  default     = 20
+}
+
+variable "instance_profile_name" {
+  type        = string
+  description = "IAM instance profile name to attach to the EC2 instance."
+  default     = null
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''',
+
+    "api_gateway": '''\
+variable "environment" {
+  description = "Deployment environment"
+  type        = string
+}
+
+variable "app_domain" {
+  description = "Application domain for CORS configuration"
+  type        = string
+  default     = ""
+}
+
+
+variable "log_retention_days" {
+  description = "CloudWatch log retention in days"
+  type        = number
+  default     = 7
+}
+
+variable "lambda_invoke_arn" {
+  description = "Lambda invoke ARN for API Gateway integration"
+  type        = string
+}
+
+variable "lambda_function_name" {
+  description = "Lambda function name for permission"
+  type        = string
+}
+
+variable "kms_key_arn" {
+  description = "KMS key ARN for CloudWatch log group encryption"
+  type        = string
+  default     = null
+}
+
+variable "cognito_client_id" {
+  description = "Cognito user pool client ID for JWT authorizer"
+  type        = string
+  default     = null
+}
+
+variable "cognito_issuer_url" {
+  description = "Cognito issuer URL for JWT authorizer"
+  type        = string
+  default     = null
+}
+''',
 }
 
 # outputs.tf content for each service module
@@ -1828,14 +2469,112 @@ output "dashboard_name" {
   value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
 }
 ''',
+
+    "s3": '''\
+output "bucket_arns" {
+  description = "Map of S3 bucket ARNs. Keys match the buckets input variable."
+  value       = { for k, b in aws_s3_bucket.this : k => b.arn }
+}
+
+output "bucket_names" {
+  description = "Map of S3 bucket names. Keys match the buckets input variable."
+  value       = { for k, b in aws_s3_bucket.this : k => b.id }
+}
+''',
+
+    "ec2": '''\
+output "instance_id" {
+  description = "EC2 instance ID."
+  value       = module.ec2_instance.id
+}
+
+output "private_ip" {
+  description = "Private IP address of the EC2 instance."
+  value       = module.ec2_instance.private_ip
+}
+
+output "instance_arn" {
+  description = "ARN of the EC2 instance."
+  value       = module.ec2_instance.arn
+}
+''',
+
+    "cognito": '''\
+output "user_pool_id" {
+  description = "Cognito user pool ID"
+  value       = aws_cognito_user_pool.main.id
+}
+
+output "client_id" {
+  description = "Cognito user pool app client ID"
+  value       = aws_cognito_user_pool_client.app.id
+}
+
+output "user_pool_arn" {
+  description = "Cognito user pool ARN"
+  value       = aws_cognito_user_pool.main.arn
+}
+''',
+
+    "api_gateway": '''\
+output "api_id" {
+  description = "API Gateway v2 API ID (used in CloudWatch alarm dimensions)"
+  value       = aws_apigatewayv2_api.main.id
+}
+
+output "api_endpoint" {
+  description = "API Gateway v2 invoke URL"
+  value       = aws_apigatewayv2_stage.default.invoke_url
+}
+
+output "api_execution_arn" {
+  description = "API Gateway execution ARN (used for Lambda permission source_arn)"
+  value       = aws_apigatewayv2_api.main.execution_arn
+}
+''',
 }
 
 
-def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") -> None:
+def _prune_absent_module_refs(main_tf_path: Path, modules_dir: Path) -> None:
+    """Replace references to modules that were never generated with `null`.
+
+    Terraform errors on a reference to an undeclared module even inside try(),
+    so `try(module.kms.key_arn, null)` breaks when no kms module exists. We
+    rewrite such references to `null` for any module not present under modules/.
+    'vpc' is always present (networking.tf), so it is treated as generated.
     """
-    Write modules/<svc>/{main.tf, variables.tf, outputs.tf} using the
-    map(object) + for_each pattern matching terraform_templates reference.
-    The Jinja2-rendered HCL is replaced by static, reusable module templates.
+    import re
+    if not main_tf_path.exists():
+        return
+    present = {"vpc"}
+    if modules_dir.exists():
+        present |= {p.name for p in modules_dir.iterdir() if p.is_dir()}
+
+    text = main_tf_path.read_text(encoding="utf-8")
+
+    # try(module.NAME.attr, DEFAULT) -> DEFAULT when NAME is not generated
+    def _repl_try(m: re.Match) -> str:
+        name, default = m.group(1), m.group(2).strip()
+        return default if name not in present else m.group(0)
+
+    text = re.sub(
+        r"try\(\s*module\.(\w+)\.[\w.]+\s*,\s*([^)]+?)\s*\)",
+        _repl_try,
+        text,
+    )
+    main_tf_path.write_text(text, encoding="utf-8")
+
+
+def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -> None:
+    """
+    Write modules/<svc>/{main.tf, variables.tf, outputs.tf}.
+
+    main.tf priority:
+      1. A hardened static template in _MODULE_MAIN_HCL (guaranteed Checkov-clean),
+      2. else the Jinja2-rendered HCL passed in by the caller (rendered_hcl),
+      3. else a TODO placeholder.
+    This lets services like rds/autoscaling use their rendered template while
+    kms/s3/secrets-manager/cloudwatch keep their hardened static versions.
     """
     mod_name = svc.replace("-", "_")
     mod_dir  = modules_dir / mod_name
@@ -1855,9 +2594,42 @@ def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") ->
         f'# Add new resources by editing tfvars only — no module code changes needed.\n\n'
     )
 
-    main_hcl   = _MODULE_MAIN_HCL.get(svc, f'# TODO: add {svc} resources here\n')
-    vars_hcl   = _MODULE_VARS_TF.get(svc, 'variable "tags" { type = map(string)\n  default = {} }\n')
+    _TAGS_VAR_FALLBACK = (
+        'variable "tags" {\n'
+        '  type    = map(string)\n'
+        '  default = {}\n'
+        '}\n'
+    )
+    main_hcl   = (
+        _MODULE_MAIN_HCL.get(svc)                       # 1. hardened static
+        or (rendered_hcl if rendered_hcl.strip() else None)  # 2. Jinja render
+        or f'# TODO: add {svc} resources here\n'        # 3. placeholder
+    )
+    vars_hcl   = _MODULE_VARS_TF.get(svc, _TAGS_VAR_FALLBACK)
     output_hcl = _MODULE_OUTPUTS_TF.get(svc, f'# Add outputs for the {svc} module.\n')
+
+    # Auto-declare every var.* the module body references but variables.tf
+    # doesn't declare (Jinja templates reference environment/region/etc.
+    # that the static fallback vars file knows nothing about).
+    used     = set(re.findall(r'\bvar\.([A-Za-z_][A-Za-z0-9_]*)', main_hcl))
+    declared = set(re.findall(r'variable\s+"([^"]+)"', vars_hcl))
+    auto_declared = sorted(used - declared)
+    _AUTOVAR_TYPES: dict[str, tuple[str, str | None]] = {
+        # name: (type, default-literal or None = required, wired from root)
+        "environment":        ("string", None),
+        "project_name":       ("string", None),
+        "region":             ("string", None),
+        "name_prefix":        ("string", None),
+        "tags":               ("map(string)", "{}"),
+        "log_retention_days": ("number", "365"),
+    }
+    for vname in auto_declared:
+        vtype, vdefault = _AUTOVAR_TYPES.get(vname, ("string", "null"))
+        block = f'variable "{vname}" {{\n  type = {vtype}\n'
+        if vdefault is not None:
+            block += f'  default = {vdefault}\n'
+        block += '}\n'
+        vars_hcl = vars_hcl.rstrip() + "\n\n" + block
 
     (mod_dir / "main.tf").write_text(header + main_hcl,  encoding="utf-8")
     (mod_dir / "variables.tf").write_text(vars_hcl,       encoding="utf-8")
@@ -1865,15 +2637,26 @@ def _write_service_module(modules_dir: Path, svc: str, _hcl_unused: str = "") ->
 
     typer.secho(f"  + modules/{mod_name}/  [main.tf, variables.tf, outputs.tf]",
                 fg=typer.colors.CYAN)
+    return auto_declared
 
 
-def _service_module_call(svc: str) -> str:
+def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
     """
     Generate root main.tf module call block.
     Passes the whole map variable — not individual scalars.
+    extra_vars: auto-declared module vars (from _write_service_module) to wire
+    from root values when a known mapping exists.
     """
     mod_name = svc.replace("-", "_")
     _CALLS: dict[str, str] = {
+        "s3": (
+            f'module "s3" {{\n'
+            f'  source = "./modules/s3"\n\n'
+            f'  buckets     = var.s3_buckets\n'
+            f'  kms_key_arn = try(module.kms.key_arn, null)\n'
+            f'  tags        = local.common_tags\n'
+            f'}}\n'
+        ),
         "sqs": (
             f'module "sqs" {{\n'
             f'  source = "./modules/sqs"\n\n'
@@ -1930,7 +2713,7 @@ def _service_module_call(svc: str) -> str:
             f'module "cloudwatch" {{\n'
             f'  source = "./modules/cloudwatch"\n\n'
             f'  log_retention_days = var.log_retention_days\n'
-            f'  sns_topic_arn      = try(module.sns.topic_arn, null)\n'
+            f'  sns_topic_arn      = null\n'
             f'  lambda_log_groups  = local.lambda_log_groups\n'
             f'  cloudwatch_alarms  = var.cloudwatch_alarms\n'
             f'  dashboard          = var.dashboard\n'
@@ -1938,13 +2721,68 @@ def _service_module_call(svc: str) -> str:
             f'  tags               = local.common_tags\n'
             f'}}\n'
         ),
+        "api-gateway": (
+            f'module "api_gateway" {{\n'
+            f'  source = "./modules/api_gateway"\n\n'
+            f'  environment          = var.environment\n'
+            f'  log_retention_days   = var.log_retention_days\n'
+            f'  kms_key_arn          = try(module.kms.key_arn, null)\n'
+            f'  lambda_invoke_arn    = module.lambda.invoke_arn\n'
+            f'  lambda_function_name = module.lambda.function_name\n'
+            f'}}\n'
+        ),
     }
-    return _CALLS.get(svc, (
+    # Database + ASG modules need networking + security group + KMS wired in.
+    _DB_CALL = (
         f'module "{mod_name}" {{\n'
         f'  source = "./modules/{mod_name}"\n\n'
-        f'  tags = local.common_tags\n'
+        f'  environment        = var.environment\n'
+        f'  multi_az           = var.multi_az\n'
+        f'  private_subnet_ids = module.vpc.private_subnets\n'
+        f'  security_group_id  = aws_security_group.app.id\n'
+        f'  kms_key_arn        = try(module.kms.key_arn, null)\n'
+        f'  tags               = local.common_tags\n'
         f'}}\n'
-    ))
+    )
+    if svc in ("rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql"):
+        return _DB_CALL
+    if svc == "autoscaling":
+        return (
+            f'module "autoscaling" {{\n'
+            f'  source = "./modules/autoscaling"\n\n'
+            f'  environment           = var.environment\n'
+            f'  private_subnet_ids    = module.vpc.private_subnets\n'
+            f'  security_group_id     = aws_security_group.app.id\n'
+            f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
+            f'  instance_profile_name = aws_iam_instance_profile.ec2.name\n'
+            f'  tags                  = local.common_tags\n'
+            f'}}\n'
+        )
+    if svc in _CALLS:
+        return _CALLS[svc]
+
+    # Default call: wire any auto-declared module vars that map to known root
+    # values (see _write_service_module). Vars without a mapping were declared
+    # with a default in the module, so they need no wiring here.
+    _ROOT_RHS = {
+        "environment":        "var.environment",
+        "project_name":       "var.project_name",
+        "region":             "var.region",
+        "name_prefix":        '"${var.project_name}-${var.environment}"',
+        "kms_key_arn":        "try(module.kms.key_arn, null)",
+        "vpc_id":             "module.vpc.vpc_id",
+        "private_subnet_ids": "module.vpc.private_subnets",
+        "public_subnet_ids":  "module.vpc.public_subnets",
+        "security_group_id":  "aws_security_group.app.id",
+    }
+    lines = [f'module "{mod_name}" {{', f'  source = "./modules/{mod_name}"', '']
+    wired = [(v, _ROOT_RHS[v]) for v in (extra_vars or []) if v in _ROOT_RHS]
+    width = max([len(v) for v, _ in wired] + [4])
+    for vname, rhs in wired:
+        lines.append(f'  {vname:<{width}} = {rhs}')
+    lines.append(f'  {"tags":<{width}} = local.common_tags')
+    lines.append('}')
+    return "\n".join(lines) + "\n"
 
 
 def _write_modules_scaffold(base: Path, services: list[str]) -> None:
@@ -1970,7 +2808,7 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         "# Ref: https://registry.terraform.io/browse/modules?provider=aws\n"
         "#\n"
         "# SECURITY DEFAULTS ENFORCED\n"
-        "#   - All resources tagged with Project/Owner/Environment/CostCenter\n"
+        "#   - All resources tagged with Project/Owner/Environment\n"
         "#   - Encryption at rest enforced in each service module (KMS CMK)\n"
         "#   - S3: block_public_access enabled on every bucket\n"
         "#   - SQS/SNS: sqs_managed_sse_enabled = true; kms_master_key_id set\n"
@@ -1997,7 +2835,6 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         f'      Project     = var.project_name\n'
         f'      Owner       = var.owner\n'
         f'      Environment = var.environment\n'
-        f'      CostCenter  = var.cost_centre\n'
         f'      ManagedBy   = "devops-scaffold-tool"\n'
         f'    }}\n'
         f'  }}\n'
@@ -2011,7 +2848,6 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
         f'    Project     = var.project_name\n'
         f'    Owner       = var.owner\n'
         f'    Environment = var.environment\n'
-        f'    CostCenter  = var.cost_centre\n'
         f'    ManagedBy   = "devops-scaffold-tool"\n'
         f'  }}\n'
         f'}}\n'
@@ -2044,6 +2880,22 @@ def _write_variables_tf(base: Path, service_vars: list[dict], services: list[str
         lines.append(f'  type        = {var["type"]}')
         lines.append("}")
         lines.append("")
+
+    # Common cross-cutting vars referenced by module calls (multi_az for DBs,
+    # log_retention_days for cloudwatch/lambda). Declared with sensible defaults
+    # so they are valid even if not overridden per-environment.
+    for _name, _type, _default, _desc in [
+        ("multi_az", "bool", "false", "Deploy databases as Multi-AZ (prod recommended)"),
+        ("log_retention_days", "number", "30", "CloudWatch log retention in days"),
+    ]:
+        if _name not in seen:
+            seen.add(_name)
+            lines.append(f'variable "{_name}" {{')
+            lines.append(f'  description = "{_desc}"')
+            lines.append(f'  type        = {_type}')
+            lines.append(f'  default     = {_default}')
+            lines.append("}")
+            lines.append("")
 
     # Scalar service vars (eks, lambda sizing)
     for var in service_vars:
@@ -2094,13 +2946,9 @@ variable "sns" {
   default = null
 }
 ''',
-        "kms": '''\
-variable "kms_deletion_window_days" {
-  description = "KMS key deletion window in days (7-30)."
-  type        = number
-  default     = 7
-}
-''',
+        # NOTE: kms_deletion_window_days is declared via the scalar-var path
+        # (_SCALAR_SVC_VARS["kms"]) so it carries per-env values. Do NOT declare
+        # it here too — that produced a duplicate variable declaration.
         "ecr": '''\
 variable "ecr_repositories" {
   description = "Map of ECR repositories. Add a repo by adding one block here."
@@ -2169,9 +3017,30 @@ variable "dashboard" {
     }
 
     for svc in services:
+        # Direct match
         if svc in _MAP_VARS and svc not in seen:
             seen.add(svc)
             lines.append(_MAP_VARS[svc])
+
+    # s3_buckets map var — emitted once when any s3-* service is present
+    _has_s3 = any(
+        svc == "s3" or (dg._base_svc(svc, {"services": {"s3": {}}}) == "s3")
+        for svc in services
+    )
+    if _has_s3 and "s3_buckets" not in seen:
+        seen.add("s3_buckets")
+        lines.append('''\
+variable "s3_buckets" {
+  description = "Map of S3 buckets. Key = role (java, php, doc, ui). Add a bucket by adding one block here."
+  type = map(object({
+    name           = string
+    versioning     = bool
+    lifecycle_days = number
+    force_destroy  = bool
+  }))
+  default = {}
+}
+''')
 
     # lambda_configs always added when lambda is present
     if "lambda" in services and "lambda_configs" not in seen:
@@ -2237,11 +3106,11 @@ locals {
 
   # Convenience maps used by eventbridge and cloudwatch modules
   lambda_arns = {
-    for key, fn in module.lambda : key => fn.function_arn
+    app = module.lambda.function_arn
   }
 
   lambda_function_names = {
-    for key, fn in module.lambda : key => fn.function_name
+    app = module.lambda.function_name
   }
 
   # CloudWatch log group per Lambda function
@@ -2252,6 +3121,13 @@ locals {
       retention_in_days = var.log_retention_days
     }
   }
+}
+''')
+    else:
+        # No lambda, but cloudwatch/other modules may still reference this local.
+        blocks.append('''\
+locals {
+  lambda_log_groups = {}
 }
 ''')
 
@@ -2337,6 +3213,9 @@ def _write_env_files(
             if name in seen_names:
                 continue
             seen_names.add(name)
+            # s3_map vars are rendered as HCL obj_blocks, not scalar lines
+            if var.get("type") == "s3_map":
+                continue
             val = _env_override(name, env_cfg) or dg._env_value_for(var, env_name)
             scalar_lines.append(_format_tfvar(name, val))
 
@@ -2350,6 +3229,27 @@ def _write_env_files(
 
         # Build map(object) blocks
         obj_blocks: list[str] = []
+
+        # ── S3 buckets map ────────────────────────────────────────────────────
+        _s3_map_vars = [v for v in service_vars if v.get("type") == "s3_map" and v["name"] == "s3_buckets"]
+        if _s3_map_vars:
+            role_cfgs = _s3_map_vars[0].get("_env_values", {}).get(env_name, {})
+            if role_cfgs:
+                bucket_lines = ["s3_buckets = {"]
+                for role, cfg in role_cfgs.items():
+                    vers = str(cfg["versioning"]).lower()
+                    ld   = cfg["lifecycle_days"]
+                    fd   = str(cfg["force_destroy"]).lower()
+                    bucket_lines += [
+                        f'  {role} = {{',
+                        f'    name           = "{cfg["name"]}"',
+                        f'    versioning     = {vers}',
+                        f'    lifecycle_days = {ld}',
+                        f'    force_destroy  = {fd}',
+                        f'  }}',
+                    ]
+                bucket_lines.append("}")
+                obj_blocks.append("# S3 bucket configurations\n# Add a new bucket by adding a block — no module code changes needed.\n" + "\n".join(bucket_lines) + "\n")
 
         if "lambda" in services:
             lambda_cfg = env_cfg.get("lambda", {})
@@ -2465,25 +3365,27 @@ sns = {{
             fn_name = f"{project_name}-{env_name}-func"
             q_name  = f"{project_name}-{env_name}-queue"
             d_name  = f"{project_name}-{env_name}-dlq"
-            obj_blocks.append(f'''\
-# CloudWatch alarms
-cloudwatch_alarms = {{
-  lambdas = {{
-    deploy = {{ name = "{fn_name}", threshold = 1, enabled = true }}
-  }}
-  sqs = {{
-    main_queue = {{ name = "{q_name}", threshold = 100, enabled = true }}
-  }}
-  dlq = {{
-    main_dlq = {{ name = "{d_name}", threshold = 1, enabled = true }}
-  }}
-}}
-
-dashboard = {{
-  name = "{project_name}-{env_name}-dashboard"
-  body = {{}}
-}}
-''')
+            # Only emit alarm groups for services that actually exist in the stack,
+            # otherwise the module builds alarms for non-existent lambdas/queues.
+            _lambdas_blk = (
+                f'  lambdas = {{\n    deploy = {{ name = "{fn_name}", threshold = 1, enabled = true }}\n  }}\n'
+                if "lambda" in services else "  lambdas = {}\n"
+            )
+            _sqs_blk = (
+                f'  sqs = {{\n    main_queue = {{ name = "{q_name}", threshold = 100, enabled = true }}\n  }}\n'
+                if "sqs" in services else "  sqs = {}\n"
+            )
+            _dlq_blk = (
+                f'  dlq = {{\n    main_dlq = {{ name = "{d_name}", threshold = 1, enabled = true }}\n  }}\n'
+                if "sqs" in services else "  dlq = {}\n"
+            )
+            obj_blocks.append(
+                "# CloudWatch alarms — only groups for services present in this stack.\n"
+                "cloudwatch_alarms = {\n"
+                + _lambdas_blk + _sqs_blk + _dlq_blk +
+                "}\n\n"
+                f'dashboard = {{\n  name = "{project_name}-{env_name}-dashboard"\n  body = {{}}\n}}\n'
+            )
 
         # Assemble tfvars
         tfvars_lines = [
@@ -2495,7 +3397,6 @@ dashboard = {{
             f'environment  = "{env_name}"',
             f'owner        = "{owner}"',
             f'vpc_cidr     = "10.0.0.0/16"',
-            f'cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
 
         if scalar_lines:
@@ -2518,7 +3419,6 @@ dashboard = {{
             f'# environment  = "{env_name}"',
             f'# owner        = "REPLACE_WITH_OWNER"',
             f'# vpc_cidr     = "10.0.0.0/16"',
-            f'# cost_centre  = "REPLACE_WITH_COST_CENTRE"',
         ]
         for line in scalar_lines:
             example_lines.append(f'# {line}')
@@ -2612,6 +3512,200 @@ def _write_secrets_policy(base: Path, project_name: str, data_stores: list) -> N
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 # .gitignore
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
+    """Write security.tf: shared app security group + optional EC2 instance profile.
+
+    These are root-level resources referenced by many modules. The app security
+    group lives in the VPC module's VPC; the EC2 instance profile is only created
+    when an ec2 / autoscaling service is present.
+    """
+    _cat = dg.load_catalog()
+    _bases = {dg._base_svc(s, _cat) or s for s in services}
+    needs_instance_profile = bool({"ec2", "autoscaling"} & _bases)
+
+    # Services that attach to the shared app security group. If none are present
+    # (e.g. a static-site or pure-data stack), don't create the SG — an
+    # unattached security group fails Checkov CKV2_AWS_5.
+    _SG_CONSUMERS = {
+        "alb", "ec2", "autoscaling", "ecs-fargate", "eks",
+        "rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql",
+        "redis", "memcached", "opensearch", "documentdb",
+    }
+    if not (_SG_CONSUMERS & _bases):
+        # Nothing needs the SG/instance profile — remove any stale security.tf
+        # left by a previous run so it doesn't fail CKV2_AWS_5 (unattached SG).
+        _stale = base / "security.tf"
+        if _stale.exists():
+            _stale.unlink()
+        return
+
+    blocks = [
+        "# security.tf — shared app security group + IAM glue (root-level)",
+        "# Referenced by modules (alb, ec2, autoscaling, rds, ...) via their inputs.",
+        "",
+        'resource "aws_security_group" "app" {',
+        '  #checkov:skip=CKV2_AWS_5:Attached via module inputs (security_group_id) when compute/data services are present',
+        '  name_prefix = "${local.name_prefix}-app-"',
+        '  description = "Shared application security group"',
+        "  vpc_id      = module.vpc.vpc_id",
+        "",
+        "  tags = local.common_tags",
+        "",
+        "  lifecycle {",
+        "    create_before_destroy = true",
+        "  }",
+        "}",
+        "",
+        "# HTTPS in from within the VPC (ALB → app). Adjust CIDRs as needed.",
+        'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+        '  security_group_id = aws_security_group.app.id',
+        '  description       = "HTTPS from within the VPC"',
+        "  cidr_ipv4         = var.vpc_cidr",
+        "  from_port         = 443",
+        "  to_port           = 443",
+        '  ip_protocol       = "tcp"',
+        "}",
+        "",
+        'resource "aws_vpc_security_group_egress_rule" "app_all" {',
+        '  security_group_id = aws_security_group.app.id',
+        '  description       = "Allow all outbound"',
+        '  cidr_ipv4         = "0.0.0.0/0"',
+        '  ip_protocol       = "-1"',
+        "}",
+    ]
+
+    if needs_instance_profile:
+        blocks += [
+            "",
+            "# EC2 instance profile — attach app permissions to instances/ASG.",
+            'resource "aws_iam_role" "ec2" {',
+            '  name_prefix        = "${local.name_prefix}-ec2-"',
+            "  assume_role_policy = jsonencode({",
+            '    Version = "2012-10-17"',
+            "    Statement = [{",
+            '      Action    = "sts:AssumeRole"',
+            '      Effect    = "Allow"',
+            '      Principal = { Service = "ec2.amazonaws.com" }',
+            "    }]",
+            "  })",
+            "  tags = local.common_tags",
+            "}",
+            "",
+            '# SSM core access for patching/session-manager (no inbound SSH needed).',
+            'resource "aws_iam_role_policy_attachment" "ec2_ssm" {',
+            "  role       = aws_iam_role.ec2.name",
+            '  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"',
+            "}",
+            "",
+            'resource "aws_iam_instance_profile" "ec2" {',
+            '  name_prefix = "${local.name_prefix}-ec2-"',
+            "  role        = aws_iam_role.ec2.name",
+            "}",
+        ]
+
+    (base / "security.tf").write_text("\n".join(blocks) + "\n", encoding="utf-8")
+    typer.secho("  + security.tf  [app security group"
+                + (" + ec2 instance profile]" if needs_instance_profile else "]"),
+                fg=typer.colors.GREEN)
+
+
+def _write_run_readme(base: Path, project_name: str, env_names: list[str]) -> None:
+    """Write README.md + Makefile explaining the per-environment terraform workflow.
+
+    Variables live in env/<env>/terraform.tfvars. Terraform only auto-loads a
+    root terraform.tfvars, so every command must pass -var-file explicitly.
+    """
+    envs = env_names or ["dev"]
+    first = envs[0]
+    env_list = " | ".join(envs)
+
+    readme = f"""\
+# {project_name} — Terraform
+
+Generated by devops-scaffold-tool.
+
+## Layout
+
+```
+.infra/
+  *.tf                     root config (provider, modules, iam, outputs, ...)
+  modules/<name>/          one reusable module per service
+  env/<env>/
+    terraform.tfvars       variable VALUES for that environment
+    backend.tf             S3 remote-state backend for that environment
+```
+
+## Running terraform per environment
+
+Variable values live in `env/<env>/terraform.tfvars`. **Terraform does not
+auto-load these** (it only auto-loads a root `terraform.tfvars`), so you must
+pass `-var-file` on every command. Environments: `{env_list}`.
+
+### Local (no remote state)
+
+```bash
+terraform init -backend=false
+terraform plan  -var-file=env/{first}/terraform.tfvars
+terraform apply -var-file=env/{first}/terraform.tfvars
+```
+
+### With the S3 remote backend
+
+Each environment has its own backend in `env/<env>/backend.tf`. Select one by
+copying it to the root before init:
+
+```bash
+cp env/{first}/backend.tf ./backend.tf     # switch env by copying a different one
+terraform init                             # fill in REPLACE_WITH_* values first
+terraform plan  -var-file=env/{first}/terraform.tfvars
+terraform apply -var-file=env/{first}/terraform.tfvars
+```
+
+> Tip: switching environments = copy that env's `backend.tf` to root and
+> re-run `terraform init -reconfigure`, then use its `-var-file`.
+
+## Makefile shortcuts
+
+```bash
+make init  ENV={first}
+make plan  ENV={first}
+make apply ENV={first}
+```
+"""
+    (base / "README.md").write_text(readme, encoding="utf-8")
+
+    makefile = f"""\
+# Terraform per-environment shortcuts. Usage: make plan ENV={first}
+ENV ?= {first}
+VARS := -var-file=env/$(ENV)/terraform.tfvars
+
+.PHONY: init plan apply destroy fmt validate
+
+init:
+\tcp env/$(ENV)/backend.tf ./backend.tf
+\tterraform init -reconfigure
+
+init-local:
+\tterraform init -backend=false
+
+plan:
+\tterraform plan $(VARS)
+
+apply:
+\tterraform apply $(VARS)
+
+destroy:
+\tterraform destroy $(VARS)
+
+fmt:
+\tterraform fmt -recursive
+
+validate:
+\tterraform validate
+"""
+    (base / "Makefile").write_text(makefile, encoding="utf-8")
+
 
 def _write_gitignore(base: Path) -> None:
     (base / ".gitignore").write_text(

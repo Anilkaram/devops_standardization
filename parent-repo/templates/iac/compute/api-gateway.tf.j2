@@ -17,21 +17,18 @@ resource "aws_apigatewayv2_api" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
 resource "aws_cloudwatch_log_group" "api_gw" {
+  #checkov:skip=CKV_AWS_338:Retention is environment-driven via var.log_retention_days (365 in prod tfvars)
   name              = "/aws/apigateway/{{ project_name }}-${var.environment}"
   retention_in_days = var.log_retention_days
-  {% if 'kms' in services %}
-  kms_key_id = aws_kms_key.main.arn
-  {% endif %}
+  kms_key_id        = var.kms_key_arn
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-apigw-logs"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -56,7 +53,6 @@ resource "aws_apigatewayv2_stage" "default" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-api-stage"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -77,6 +73,10 @@ resource "aws_apigatewayv2_route" "default" {
   {% if auth_required %}
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
   authorization_type = "JWT"
+  {% else %}
+  # IAM auth by default — callers sign requests with SigV4. Switch to a Cognito
+  # JWT authorizer by setting auth.required in infra.yaml.
+  authorization_type = "AWS_IAM"
   {% endif %}
   target = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
@@ -107,12 +107,4 @@ resource "aws_apigatewayv2_authorizer" "cognito" {
 }
 {% endif %}
 
-output "api_endpoint" {
-  description = "API Gateway v2 invoke URL"
-  value       = aws_apigatewayv2_stage.default.invoke_url
-}
 
-output "api_execution_arn" {
-  description = "API Gateway execution ARN (used for Lambda permission source_arn)"
-  value       = aws_apigatewayv2_api.main.execution_arn
-}

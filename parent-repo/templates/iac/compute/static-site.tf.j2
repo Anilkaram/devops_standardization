@@ -10,7 +10,6 @@ resource "aws_s3_bucket" "{{ pn }}_site" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-site"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -106,7 +105,6 @@ resource "aws_cloudfront_distribution" "site" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-cdn"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 

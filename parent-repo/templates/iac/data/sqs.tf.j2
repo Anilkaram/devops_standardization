@@ -9,7 +9,6 @@ resource "aws_sqs_queue" "dlq" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-dlq"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 
@@ -39,7 +38,6 @@ resource "aws_sqs_queue" "main" {
   tags = {
     Name        = "{{ project_name }}-${var.environment}-queue"
     Environment = var.environment
-    CostCentre  = var.cost_centre
   }
 }
 {% if 'sqs->lambda' in connections %}
