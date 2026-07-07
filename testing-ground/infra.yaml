@@ -1,159 +1,216 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# infra.yaml — Classic 3-Tier AWS Architecture
+# infra.yaml — RAMS Platform (rams.emergobyul.com)
+# Architecture: CloudFront + WAF + ALB -> 3 x EC2 (Java / PHP / Doc)
+#               Each EC2 path has its own S3 bucket + RDS Multi-AZ pair
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
-# ARCHITECTURE OVERVIEW
-#   Internet → ALB (Public/DMZ subnet, spans AZ1 + AZ2)
-#            → Auto Scaling Group of EC2 Web App Servers (Private/APP subnet)
-#            → RDS Multi-AZ Primary + Standby (Private/RES subnet)
+# MULTI-INSTANCE NAMING RULE
+# ─────────────────────────────────────────────────────────────────────────────
+# When the same AWS service type appears more than once in an architecture
+# (here: EC2 x3, S3 x4, RDS x2), give each instance a unique role suffix:
 #
-# SUBNET TIERS (inside VPC, across 2 Availability Zones)
-#   Public/DMZ   — Application Load Balancer
-#   Private/APP  — Web App Servers (EC2 in Auto Scaling Group)
-#   Private/RES  — Amazon RDS (Primary AZ1, Standby AZ2, Sync Replication)
+#   WRONG ✗         RIGHT ✓
+#   - ec2           - ec2-java          (Java application servers)
+#   - ec2           - ec2-php           (PHP application servers)
+#   - ec2           - ec2-doc           (Document service servers)
 #
+#   - s3            - s3-ui             (CloudFront static UI origin)
+#   - s3            - s3-java           (ramsprod bucket)
+#   - s3            - s3-php            (rs-prod bucket)
+#   - s3            - s3-doc            (doc service storage)
+#
+#   - rds           - mysql-java        (Java path: RDS Multi-AZ)
+#   - rds           - mysql-php         (PHP path:  RDS Multi-AZ)
+#
+# The scaffold uses these names in module names, resource tags, and
+# connections — without unique names `connections:` cannot distinguish
+# which EC2 talks to which RDS.
+#
+# CATALOG FIT
+# ─────────────────────────────────────────────────────────────────────────────
+# Catalog name       Diagram label           Status
+# ────────────────   ─────────────────────   ──────────────────────────────────
+# route53            Route 53                IN CATALOG  (module)
+# cloudfront         Amazon CloudFront       IN CATALOG  (aws_cloudfront_distribution)
+# waf                AWS WAF                 IN CATALOG  (aws_wafv2_web_acl)
+# alb                ALB — Load balancer     IN CATALOG  (module)
+# ec2-java/php/doc   Amazon EC2              IN CATALOG  (module, role-suffixed)
+# s3-ui/java/php/doc Amazon S3              IN CATALOG  (aws_s3_bucket)
+# mysql-java/php     RDS (Multi-AZ)          IN CATALOG  (aws_db_instance)
+# secrets-manager    Secrets Mgr             IN CATALOG  (aws_secretsmanager_secret)
+# kms                (implied — encrypts RDS/S3) IN CATALOG (aws_kms_key)
+# cloudwatch         (implied — monitoring)  IN CATALOG  (aws_cloudwatch_log_group)
+#
+# cloudguard-fw      CloudGuard FW           NOT IN CATALOG — third-party
+#                    Terraform provider: checkpoint/cloudguard
+#                    Add manually after scaffold: see terraform-provider-cloudguard
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 project:
-  name: three-tier-app
+  name: rams-platform           # ^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$  max 20 chars
   region: us-east-1
   owner: platform-team
-  type: web-application         # classic web app — ALB + EC2 + RDS
+  type: full-stack              # static UI + Java/PHP/Doc backends
 
-stage: growth                   # multi-AZ + auto scaling → beyond prototype
+stage: production
 
 team:
-  size: small
-  ops_maturity: medium
+  size: medium
+  ops_maturity: high
 
 runtime:
-  language: node                # adjust to your web app language (node/python/java/go)
-  containerised: false          # diagram shows EC2 instances, not containers
+  language: java                # primary runtime; PHP is secondary
+  containerised: false          # diagram shows EC2 instances, not ECS/EKS
 
 # ── Services ─────────────────────────────────────────────────────────────────
-# `type` = catalog keyword (what the tool uses to find the template)
-# `name` = instance identifier (used in resource names + connections)
+# Full 1:1 inventory of the diagram's resources.
+# Role suffixes are REQUIRED wherever a service type appears more than once.
 services:
+  # DNS & Edge
+  - route53                     # rams.emergobyul.com hosted zone
 
-  # -- networking --
-  - type: vpc
-    name: main-vpc
-    cidr: 10.0.0.0/16
-    availability_zones: 2       # AZ1 + AZ2 as shown in diagram
-    subnets:
-      public_dmz:               # Public/DMZ — ALB lives here
-        az1: 10.0.0.0/24
-        az2: 10.0.1.0/24
-      private_app:              # Private/APP — Web App Servers live here
-        az1: 10.0.2.0/24
-        az2: 10.0.3.0/24
-      private_res:              # Private/RES — RDS Primary + Standby live here
-        az1: 10.0.4.0/24
-        az2: 10.0.5.0/24
+  # Frontend path: User → CloudFront → S3
+  - cloudfront                  # CDN distributing static UI to end users
+  - s3-ui                       # Static UI origin bucket (HTML/CSS/JS)
 
-  # -- load balancer (Public/DMZ subnet) --
-  - type: alb
-    name: app-load-balancer
-    subnet_tier: public_dmz     # deployed in public/DMZ subnets across both AZs
-    internet_facing: true
-    listener:
-      port: 443
-      protocol: HTTPS
-    target_group:
-      port: 80
-      protocol: HTTP
-      health_check_path: /health
+  # Security
+  - waf                         # AWS WAF attached to ALB — filters backend requests
+  # NOTE: CloudGuard FW is a third-party firewall (Check Point).
+  #       It is NOT in the AWS catalog — scaffold will skip it.
+  #       Add it manually after scaffold using terraform-provider-cloudguard.
 
-  # -- compute (Private/APP subnet) --
-  - type: autoscaling
-    name: web-app-asg
-    subnet_tier: private_app    # instances launched in private/APP subnets
-    launch_template: web-app-server
+  # Backend path: Route53 → CloudGuard FW → ALB → EC2 x3
+  - alb                         # Application Load Balancer routing to three EC2 fleets
 
-  - type: ec2
-    name: web-app-server        # Web App Server — managed by web-app-asg
-    subnet_tier: private_app
-    associate_public_ip: false  # private subnet — no direct internet access
+  # ── Compute: three separate EC2 fleets, each with its own role ──────────────
+  # Pattern: <service-type>-<role>  (must be unique, kebab-case)
+  - ec2-java                    # Java application servers  — receives "Java requests"
+  - ec2-php                     # PHP application servers   — receives "PHP requests"
+  - ec2-doc                     # Document service servers  — receives "Doc requests"
 
-  # -- database (Private/RES subnet) --
-  - type: rds
-    name: app-database
-    subnet_tier: private_res    # deployed in private/RES subnets
-    engine: mysql               # adjust to your DB engine (mysql/postgres/etc.)
-    multi_az: true              # Primary AZ1 + Standby AZ2, sync replication as shown
-    storage_encrypted: true
+  # ── Data: each EC2 fleet has its own isolated S3 bucket ────────────────────
+  - s3-java                     # S3 bucket: ramsprod  — Java server assets/uploads
+  - s3-php                      # S3 bucket: rs-prod   — PHP server assets/uploads
+  - s3-doc                      # S3 bucket: doc storage — Document service files
 
-  # -- security --
-  - type: kms
-    name: app-kms-key           # encrypts RDS storage + any future secrets
+  # ── Data: each compute fleet has its own RDS Multi-AZ pair ─────────────────
+  # Use `mysql` or `postgres` — catalog has no generic `rds` entry
+  - mysql-java                  # RDS Multi-AZ (Primary + Standby) for Java servers
+  - mysql-php                   # RDS Multi-AZ (Primary + Standby) for PHP servers
 
-  - type: secrets-manager
-    name: db-credentials        # RDS username/password — fetched by web-app-server at runtime
+  # ── Doc service dependencies ────────────────────────────────────────────────
+  - secrets-manager             # Stores DB credentials and doc-service API tokens
 
-  # -- observability --
-  - type: cloudwatch
-    name: app-observability     # metrics + alarms for ALB, ASG, EC2, RDS
+  # ── Cross-cutting: encryption + observability ───────────────────────────────
+  - kms                         # CMK encrypts all RDS instances and S3 buckets at rest
+  - cloudwatch                  # Logs + metrics from EC2 instances, RDS, and ALB
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 auth:
-  required: false               # no auth layer shown in diagram; add cognito/waf if needed
-  method: iam                   # EC2 instance role → RDS + Secrets Manager access
+  required: true
+  method: iam                   # IAM instance profiles for EC2 → S3/RDS/Secrets access
 
 # ── Connections ──────────────────────────────────────────────────────────────
+# Every arrow in the diagram represented as a directed from→to pair.
 connections:
-  # internet → ALB → EC2 (via Auto Scaling Group)
-  - { from: app-load-balancer, to: web-app-asg }      # ALB routes to ASG target group
-  - { from: web-app-asg,       to: web-app-server }   # ASG manages EC2 instances
+  # DNS routing
+  - { from: route53,        to: cloudfront    }  # Frontend: rams.emergobyul.com → CDN
+  - { from: route53,        to: alb           }  # Backend:  rams.emergobyul.com → ALB (via CloudGuard FW)
 
-  # EC2 → RDS
-  - { from: web-app-server,    to: app-database }      # app reads/writes to RDS primary
+  # Frontend static path
+  - { from: s3-ui,          to: cloudfront    }  # S3 is the CloudFront origin
 
-  # EC2 → Secrets Manager (fetch DB credentials at startup)
-  - { from: web-app-server,    to: db-credentials }
+  # WAF protects ALB
+  - { from: waf,            to: alb           }  # WAF rules evaluated before ALB routes
 
-  # KMS encrypts RDS + Secrets Manager
-  - { from: app-kms-key,       to: app-database }
-  - { from: app-kms-key,       to: db-credentials }
+  # ALB → EC2 fleet routing (one target group per fleet)
+  - { from: alb,            to: ec2-java      }  # Java requests
+  - { from: alb,            to: ec2-php       }  # PHP requests
+  - { from: alb,            to: ec2-doc       }  # Doc requests
 
-  # observability
-  - { from: app-observability, to: app-load-balancer }
-  - { from: app-observability, to: web-app-server }
-  - { from: app-observability, to: app-database }
-  - { from: app-observability, to: web-app-asg }
+  # Java fleet data access
+  - { from: ec2-java,       to: s3-java       }  # Read/write ramsprod bucket
+  - { from: ec2-java,       to: mysql-java    }  # Application DB queries
+
+  # PHP fleet data access
+  - { from: ec2-php,        to: s3-php        }  # Read/write rs-prod bucket
+  - { from: ec2-php,        to: mysql-php     }  # Application DB queries
+
+  # Doc service data + secrets access
+  - { from: ec2-doc,        to: s3-doc        }  # Document storage reads/writes
+  - { from: ec2-doc,        to: secrets-manager } # Fetch API tokens / DB credentials
+
+  # Encryption
+  - { from: kms,            to: mysql-java    }  # Encrypt RDS storage at rest
+  - { from: kms,            to: mysql-php     }  # Encrypt RDS storage at rest
+  - { from: kms,            to: s3-java       }  # SSE-KMS on bucket
+  - { from: kms,            to: s3-php        }  # SSE-KMS on bucket
+  - { from: kms,            to: s3-doc        }  # SSE-KMS on bucket
+  - { from: kms,            to: secrets-manager } # Envelope encryption on secrets
+
+  # Observability
+  - { from: ec2-java,       to: cloudwatch    }  # Instance logs + CPU/memory metrics
+  - { from: ec2-php,        to: cloudwatch    }  # Instance logs + CPU/memory metrics
+  - { from: ec2-doc,        to: cloudwatch    }  # Instance logs + CPU/memory metrics
+  - { from: mysql-java,     to: cloudwatch    }  # RDS Enhanced Monitoring
+  - { from: mysql-php,      to: cloudwatch    }  # RDS Enhanced Monitoring
+  - { from: alb,            to: cloudwatch    }  # ALB access logs + 5xx alarms
+
+# ── Flows ────────────────────────────────────────────────────────────────────
+flows:
+  frontend_flow:
+    description: "Static UI delivery: User hits rams.emergobyul.com via Route 53 which resolves to CloudFront. CloudFront serves HTML/CSS/JS directly from the S3 static UI bucket with low latency and edge caching."
+    services: [route53, cloudfront, s3-ui]
+
+  java_api_flow:
+    description: "Java backend path: Route 53 resolves backend requests through CloudGuard Firewall (manual TF) to the ALB. WAF filters the traffic before ALB routes Java requests to the EC2 Java fleet. Java servers read/write the ramsprod S3 bucket and query the Multi-AZ RDS MySQL instance."
+    services: [route53, alb, ec2-java, s3-java, mysql-java]
+
+  php_api_flow:
+    description: "PHP backend path: Same edge routing as Java. ALB routes PHP requests to the EC2 PHP fleet. PHP servers read/write the rs-prod S3 bucket and query their own dedicated Multi-AZ RDS MySQL instance."
+    services: [route53, alb, ec2-php, s3-php, mysql-php]
+
+  doc_service_flow:
+    description: "Document service path: ALB routes doc requests to the EC2 Doc fleet. Doc servers fetch API tokens from Secrets Manager, store and retrieve document files from the doc S3 bucket."
+    services: [route53, alb, ec2-doc, s3-doc, secrets-manager]
 
 # ── Environments ─────────────────────────────────────────────────────────────
+# dev: single-AZ, smaller instances, no Multi-AZ RDS
+# prod: Multi-AZ RDS (matches diagram), larger instances
 environments:
   dev:
-    multi_az: false             # single AZ for dev — cost saving
-    autoscaling:
-      web-app-asg:
-        min_size: 1
-        max_size: 2
-        desired_capacity: 1
-    ec2:
-      web-app-server:
-        instance_type: t3.small
-    rds:
-      app-database:
-        instance_class: db.t3.medium
-        multi_az: false
+    multi_az: false
+    # EC2 fleet sizing
+    ec2-java:
+      instance_type: t3.medium
+    ec2-php:
+      instance_type: t3.medium
+    ec2-doc:
+      instance_type: t3.small
+    # RDS sizing — single-AZ in dev
+    mysql-java:
+      instance_class: db.t3.medium
+      multi_az: false
+    mysql-php:
+      instance_class: db.t3.medium
+      multi_az: false
 
   prod:
-    multi_az: true              # matches diagram — AZ1 primary, AZ2 standby
-    autoscaling:
-      web-app-asg:
-        min_size: 2             # one instance per AZ at minimum
-        max_size: 6
-        desired_capacity: 2
-        scale_out_cpu_threshold: 70
-        scale_in_cpu_threshold: 30
-    ec2:
-      web-app-server:
-        instance_type: t3.medium
-    rds:
-      app-database:
-        instance_class: db.r5.large
-        multi_az: true          # sync replication to standby in AZ2 as shown
+    multi_az: true              # matches "RDS (Multi-AZ)" Primary/Standby in diagram
+    # EC2 fleet sizing
+    ec2-java:
+      instance_type: m5.large
+    ec2-php:
+      instance_type: m5.large
+    ec2-doc:
+      instance_type: t3.medium
+    # RDS sizing — Multi-AZ matches diagram
+    mysql-java:
+      instance_class: db.r5.large
+      multi_az: true
+    mysql-php:
+      instance_class: db.r5.large
+      multi_az: true
 
 # ── CI/CD ────────────────────────────────────────────────────────────────────
 cicd:
@@ -161,3 +218,21 @@ cicd:
     - dev
   manual_deploy:
     - prod
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WHAT THE SCAFFOLD GENERATES vs. WHAT YOU ADD MANUALLY
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-generated by scaffold:
+#   modules/ec2_java/     modules/ec2_php/     modules/ec2_doc/
+#   modules/s3_java/      modules/s3_php/      modules/s3_doc/    modules/s3_ui/
+#   modules/mysql_java/   modules/mysql_php/
+#   modules/secrets_manager/  modules/kms/  modules/cloudwatch/
+#   networking.tf (VPC, public + private subnets)
+#   iam.tf (EC2 instance profiles → S3/RDS/Secrets permissions)
+#   cicd/pipeline.yml
+#
+# Add manually after scaffold:
+#   CloudGuard FW — terraform-provider-cloudguard (Check Point third-party)
+#   Route 53 health checks (scaffold creates the hosted zone record only)
+#   CloudFront WAF association (connect waf module ARN to cloudfront module)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
