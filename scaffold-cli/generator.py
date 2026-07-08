@@ -177,10 +177,6 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
          "description": "ACM certificate ARN for the HTTPS listener (TLS 1.2+)",
          "dev": "REPLACE_WITH_ACM_CERT_ARN", "staging": "REPLACE_WITH_ACM_CERT_ARN",
          "prod": "REPLACE_WITH_ACM_CERT_ARN"},
-        {"name": "alb_access_logs_bucket", "type": "string",
-         "description": "S3 bucket name for ALB access logs",
-         "dev": "REPLACE_WITH_LOG_BUCKET", "staging": "REPLACE_WITH_LOG_BUCKET",
-         "prod": "REPLACE_WITH_LOG_BUCKET"},
     ],
     "opensearch": [
         {"name": "opensearch_instance_type",  "type": "string",
@@ -674,6 +670,19 @@ def generate_scaffold(
     # falls back to service-managed keys (e.g. S3 SSE-AES256) unless the user
     # explicitly lists `kms`.
 
+    # ── modules/iam — reusable role factory (always generated) ──────────────
+    # Auto-generated service roles live in root iam.tf; this module lets teams
+    # add CUSTOM roles by editing tfvars only (map(object) + for_each pattern).
+    _write_iam_module(modules_dir)
+    service_module_calls.append(
+        'module "iam" {\n'
+        '  source = "./modules/iam"\n'
+        '\n'
+        '  iam_roles = var.iam_roles\n'
+        '  tags      = local.common_tags\n'
+        '}\n'
+    )
+
     # Append service module calls to root main.tf
     if service_module_calls:
         main_tf_path = base / "main.tf"
@@ -749,7 +758,6 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
         ("security_group_id",      "string",       "aws_security_group.app.id"),
         ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
-        ("alb_access_logs_bucket", "string",       "var.alb_access_logs_bucket"),
     ],
     "lambda": [
         ("name_prefix",          "string",      '"${var.project_name}-${var.environment}"'),
@@ -1091,7 +1099,7 @@ def _inject_s3_buckets_var(
                 "name":           f"{project_name}-{env_name}-{role}",
                 "versioning":     svc_cfg.get("versioning", True),
                 "lifecycle_days": svc_cfg.get("lifecycle_days", 90),
-                "force_destroy":  svc_cfg.get("force_destroy", False),
+                "force_destroy":  svc_cfg.get("force_destroy", env_name not in ("prod", "production", "live")),
             }
         env_defaults[env_name] = role_cfgs
 
@@ -1458,6 +1466,34 @@ resource "aws_kms_key" "main" {
         Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
         Action    = "kms:*"
         Resource  = "*"
+      },
+      # Auto Scaling launches instances with CMK-encrypted EBS volumes. Its
+      # service-linked role has NO KMS permissions of its own, so it must be
+      # granted in the key policy — otherwise instances terminate seconds
+      # after launch with Client.InvalidKMSKey.InvalidState.
+      {
+        Sid    = "AllowAutoScalingUseOfKey"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        }
+        Action = [
+          "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*",
+          "kms:GenerateDataKey*", "kms:DescribeKey"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowAutoScalingGrants"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        }
+        Action   = "kms:CreateGrant"
+        Resource = "*"
+        Condition = {
+          Bool = { "kms:GrantIsForAWSResource" = true }
+        }
       }
     ]
   })
@@ -1663,11 +1699,6 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
   dimensions = { QueueName = each.value.name }
 
   alarm_actions = var.sns_topic_arn != null ? [var.sns_topic_arn] : []
-}
-
-resource "aws_cloudwatch_dashboard" "main" {
-  dashboard_name = var.dashboard.name
-  dashboard_body = jsonencode(var.dashboard.body)
 }
 ''',
 
@@ -2180,15 +2211,6 @@ variable "cloudwatch_alarms" {
   default = { lambdas = {}, sqs = {}, dlq = {} }
 }
 
-variable "dashboard" {
-  description = "CloudWatch dashboard config."
-  type = object({
-    name = string
-    body = any
-  })
-  default = null
-}
-
 variable "kms_key_arn" {
   description = "KMS key ARN used to encrypt CloudWatch log groups."
   type        = string
@@ -2463,11 +2485,6 @@ output "log_group_names" {
     for k, lg in aws_cloudwatch_log_group.lambdas : k => lg.name
   }
 }
-
-output "dashboard_name" {
-  description = "CloudWatch dashboard name."
-  value       = var.dashboard != null ? aws_cloudwatch_dashboard.main.dashboard_name : null
-}
 ''',
 
     "s3": '''\
@@ -2716,7 +2733,6 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'  sns_topic_arn      = null\n'
             f'  lambda_log_groups  = local.lambda_log_groups\n'
             f'  cloudwatch_alarms  = var.cloudwatch_alarms\n'
-            f'  dashboard          = var.dashboard\n'
             f'  kms_key_arn        = try(module.kms.key_arn, null)\n'
             f'  tags               = local.common_tags\n'
             f'}}\n'
@@ -2860,6 +2876,96 @@ def _write_provider_tf(base: Path, project_name: str, region: str,
 # variables.tf writer " declarations only, never hardcoded defaults
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
+def _write_iam_module(modules_dir: Path) -> None:
+    """Write modules/iam — a reusable role factory (map(object) + for_each).
+
+    Custom roles are added in tfvars only:
+      iam_roles = { app_role = { assume_role_services = ["ec2.amazonaws.com"], ... } }
+    Auto-generated service roles remain in root iam.tf.
+    """
+    mod_dir = modules_dir / "iam"
+    mod_dir.mkdir(parents=True, exist_ok=True)
+
+    (mod_dir / "main.tf").write_text('''\
+# Module: iam — reusable role factory
+# Add a role by adding one block to iam_roles in tfvars — no code change needed.
+
+resource "aws_iam_role" "this" {
+  for_each = var.iam_roles
+
+  name = each.key
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = each.value.assume_role_services }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+# Managed policy attachments — one per role x policy ARN pair
+locals {
+  managed_attachments = merge([
+    for role_key, cfg in var.iam_roles : {
+      for arn in cfg.managed_policy_arns :
+      "${role_key}:${arn}" => { role = role_key, arn = arn }
+    }
+  ]...)
+}
+
+resource "aws_iam_role_policy_attachment" "managed" {
+  for_each = local.managed_attachments
+
+  role       = aws_iam_role.this[each.value.role].name
+  policy_arn = each.value.arn
+}
+
+# Optional inline policy per role
+resource "aws_iam_role_policy" "inline" {
+  for_each = { for k, v in var.iam_roles : k => v if v.inline_policy != null }
+
+  name   = "${each.key}-inline-policy"
+  role   = aws_iam_role.this[each.key].id
+  policy = jsonencode(each.value.inline_policy)
+}
+''', encoding="utf-8")
+
+    (mod_dir / "variables.tf").write_text('''\
+variable "iam_roles" {
+  description = "Map of custom IAM roles. Key = role name. Add a role by adding one block in tfvars."
+  type = map(object({
+    assume_role_services = list(string)            # e.g. ["ec2.amazonaws.com"]
+    managed_policy_arns  = optional(list(string), [])
+    inline_policy        = optional(any, null)      # full IAM policy document as an object
+  }))
+  default = {}
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+''', encoding="utf-8")
+
+    (mod_dir / "outputs.tf").write_text('''\
+output "role_arns" {
+  description = "Map of role name => ARN"
+  value       = { for k, r in aws_iam_role.this : k => r.arn }
+}
+
+output "role_names" {
+  description = "Map of role name => name"
+  value       = { for k, r in aws_iam_role.this : k => r.name }
+}
+''', encoding="utf-8")
+
+    typer.secho("  + modules/iam/  [role factory — add roles via tfvars]", fg=typer.colors.CYAN)
+
+
 def _write_variables_tf(base: Path, service_vars: list[dict], services: list[str]) -> None:
     lines = [
         "# ------------------------------------------------------------------------------",
@@ -2884,6 +2990,21 @@ def _write_variables_tf(base: Path, service_vars: list[dict], services: list[str
     # Common cross-cutting vars referenced by module calls (multi_az for DBs,
     # log_retention_days for cloudwatch/lambda). Declared with sensible defaults
     # so they are valid even if not overridden per-environment.
+    # Custom IAM roles (modules/iam role factory — always generated)
+    lines.extend([
+        'variable "iam_roles" {',
+        '  description = "Map of custom IAM roles. Add a role by adding one block in tfvars — no code change."',
+        '  type = map(object({',
+        '    assume_role_services = list(string)',
+        '    managed_policy_arns  = optional(list(string), [])',
+        '    inline_policy        = optional(any, null)',
+        '  }))',
+        '  default = {}',
+        '}',
+        '',
+    ])
+    seen.add("iam_roles")
+
     for _name, _type, _default, _desc in [
         ("multi_az", "bool", "false", "Deploy databases as Multi-AZ (prod recommended)"),
         ("log_retention_days", "number", "30", "CloudWatch log retention in days"),
@@ -3003,15 +3124,6 @@ variable "cloudwatch_alarms" {
     dlq     = optional(map(object({ name = string, threshold = number, enabled = optional(bool, true) })), {})
   })
   default = { lambdas = {}, sqs = {}, dlq = {} }
-}
-
-variable "dashboard" {
-  description = "CloudWatch dashboard config."
-  type = object({
-    name = string
-    body = any
-  })
-  default = null
 }
 ''',
     }
@@ -3230,6 +3342,32 @@ def _write_env_files(
         # Build map(object) blocks
         obj_blocks: list[str] = []
 
+        # ── IAM roles ────────────────────────────────────────────────────────
+        # Every role in this map becomes a real IAM role via modules/iam, so the
+        # user can SEE and edit their roles here. The inventory comment also lists
+        # the roles this stack creates IN CODE (they cannot live in this map
+        # because other resources reference them by their Terraform address).
+        obj_blocks.append(f'''\
+# ── IAM roles ────────────────────────────────────────────────────────────────
+# Roles created IN CODE by this stack (referenced directly by other resources,
+# so they cannot live in the map below — listed here for full visibility):
+#   * {project_name}-{env_name}-ec2   instance role + profile  (security.tf)  -> used by ASG / EC2
+#   * {project_name}-{env_name}-rds-monitoring  enhanced-monitoring role (modules/rds) -> used by the DB
+#
+# Roles YOU control — each key below becomes module.iam.aws_iam_role.this[<key>].
+# Edit or delete the starter role; set iam_roles = {{}} to create none.
+iam_roles = {{
+  "{project_name}-{env_name}-app" = {{
+    assume_role_services = ["ec2.amazonaws.com"]
+    managed_policy_arns  = ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+    # inline_policy = {{
+    #   Version   = "2012-10-17"
+    #   Statement = [{{ Effect = "Allow", Action = ["s3:GetObject"], Resource = "*" }}]
+    # }}
+  }}
+}}
+''')
+
         # ── S3 buckets map ────────────────────────────────────────────────────
         _s3_map_vars = [v for v in service_vars if v.get("type") == "s3_map" and v["name"] == "s3_buckets"]
         if _s3_map_vars:
@@ -3384,7 +3522,6 @@ sns = {{
                 "cloudwatch_alarms = {\n"
                 + _lambdas_blk + _sqs_blk + _dlq_blk +
                 "}\n\n"
-                f'dashboard = {{\n  name = "{project_name}-{env_name}-dashboard"\n  body = {{}}\n}}\n'
             )
 
         # Assemble tfvars
@@ -3798,8 +3935,8 @@ _SERVICE_COST_ESTIMATES: dict[str, dict] = {
         "optimise": ["Store multiple related values as one JSON secret", "Use SSM Parameter Store (free tier) for non-sensitive config"],
     },
     "cloudwatch": {
-        "dev":  {"estimate": "$2–8",   "basis": "5 GB logs/mo, 5 alarms, 1 dashboard"},
-        "prod": {"estimate": "$20–60", "basis": "50 GB logs/mo, 20 alarms, 3 dashboards"},
+        "dev":  {"estimate": "$2–8",   "basis": "5 GB logs/mo, 5 alarms"},
+        "prod": {"estimate": "$20–60", "basis": "50 GB logs/mo, 20 alarms"},
         "notes": "First 5 GB logs/mo free. $0.50/GB ingest after. Dashboard $3/mo each.",
         "optimise": ["Set log retention (avoid indefinite storage)", "Use metric filters instead of custom metrics where possible"],
     },

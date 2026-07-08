@@ -949,7 +949,6 @@ _PLACEHOLDER_HINTS = {
     "REPLACE_WITH_LOCK_TABLE":     "DynamoDB table for state locking — created by init-backend too",
     "REPLACE_WITH_ACM_CERT_ARN":   "ACM certificate ARN for the ALB HTTPS listener (AWS Console > Certificate Manager)",
     "REPLACE_WITH_ALB_LOG_BUCKET": "S3 bucket that receives ALB access logs",
-    "REPLACE_WITH_LOG_BUCKET":     "S3 bucket that receives ALB access logs",
     "REPLACE_WITH_AMI_ID":         "AMI ID for the EC2/autoscaling instances (e.g. latest Amazon Linux 2023 in your region)",
 }
 
@@ -1114,7 +1113,13 @@ def validate(
         typer.secho("ERROR: no .infra directory. Run 'init' first.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
+    import time as _time
     results: list[tuple[str, bool, str]] = []   # (gate, ok, detail)
+    _t0 = _time.time()
+
+    def _gate(n: int, label: str) -> None:
+        typer.secho(f"\n> Gate {n}/5: {label}  [{_time.time() - _t0:.0f}s elapsed]",
+                    fg=typer.colors.BLUE, bold=True)
 
     # Gate 1: terraform init + validate
     tf = _shutil.which("terraform")
@@ -1122,23 +1127,42 @@ def validate(
         results.append(("terraform validate", False, "terraform not found on PATH"))
     else:
         try:
-            init_r = subprocess.run(
-                [tf, "init", "-backend=false", "-input=false", "-no-color"],
-                cwd=INFRA_DIR, capture_output=True, text=True, timeout=300,
-            )
-            if init_r.returncode != 0:
+            # Skip re-init when providers/modules are already installed —
+            # `terraform init` is the slowest step (provider download ~600 MB
+            # on a cold cache). A fresh generate never deletes .terraform, so
+            # reuse is safe; validate falls back to init if reuse fails.
+            tf_dir = INFRA_DIR / ".terraform"
+            needs_init = not (tf_dir / "providers").exists()
+            if needs_init:
+                _gate(1, "terraform init (first run — downloading providers, this is the slow one)")
+                init_r = subprocess.run(
+                    [tf, "init", "-backend=false", "-input=false", "-no-color"],
+                    cwd=INFRA_DIR, capture_output=True, text=True, timeout=300,
+                )
+            else:
+                _gate(1, "terraform validate (reusing installed providers)")
+                init_r = None
+            if init_r is not None and init_r.returncode != 0:
                 results.append(("terraform validate", False, "init failed: " + init_r.stderr.strip().splitlines()[-1][:100] if init_r.stderr.strip() else "init failed"))
             else:
                 val_r = subprocess.run(
                     [tf, "validate", "-no-color"],
                     cwd=INFRA_DIR, capture_output=True, text=True, timeout=120,
                 )
+                if val_r.returncode != 0 and not needs_init:
+                    # Stale .terraform (e.g. new module added since last init) — init once and retry
+                    typer.secho("  ~ cached .terraform is stale — running terraform init...", fg=typer.colors.CYAN)
+                    subprocess.run([tf, "init", "-backend=false", "-input=false", "-no-color"],
+                                   cwd=INFRA_DIR, capture_output=True, text=True, timeout=300)
+                    val_r = subprocess.run([tf, "validate", "-no-color"],
+                                           cwd=INFRA_DIR, capture_output=True, text=True, timeout=120)
                 detail = "configuration is valid" if val_r.returncode == 0 else (val_r.stderr.strip().splitlines()[-1][:100] if val_r.stderr.strip() else "validate failed")
                 results.append(("terraform validate", val_r.returncode == 0, detail))
         except subprocess.TimeoutExpired:
             results.append(("terraform validate", False, "timed out"))
 
     # Gate 2: Checkov (reuses the scoring routine, which also prints details)
+    _gate(2, "Checkov security scan (~30-60s)")
     _run_checkov_score(INFRA_DIR)
     report = INFRA_DIR / "checkov-report.txt"
     if report.exists():
@@ -1149,9 +1173,11 @@ def validate(
         results.append(("checkov security scan", False, "checkov not available"))
 
     # Gate 3: tfsec (second security scanner — different rule engine than Checkov)
+    _gate(3, "tfsec security scan")
     tfsec_ok, tfsec_detail = _run_tfsec_scan(INFRA_DIR)
     results.append(("tfsec security scan", tfsec_ok, tfsec_detail))
 
+    _gate(4, "secret + placeholder scans")
     # Gate 4: secret scan
     n_secrets = _scan_tfvars_for_secrets(INFRA_DIR)
     results.append((
@@ -1430,8 +1456,13 @@ provider "aws" {{
 resource "aws_s3_bucket" "tf_state" {{
   bucket = "{bucket_name}"
 
+  # Deletable by default so test projects can be fully torn down.
+  # PRODUCTION: set force_destroy = false and prevent_destroy = true so the
+  # state bucket (and its versioned state history) cannot be lost.
+  force_destroy = true
+
   lifecycle {{
-    prevent_destroy = true
+    prevent_destroy = false
   }}
 }}
 
@@ -1471,7 +1502,7 @@ resource "aws_dynamodb_table" "tf_locks" {{
   }}
 
   lifecycle {{
-    prevent_destroy = true
+    prevent_destroy = false  # PRODUCTION: set true to protect the lock table
   }}
 }}
 

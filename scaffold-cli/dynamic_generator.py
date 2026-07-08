@@ -155,13 +155,13 @@ def generate_vpc_layer(
     db_subnet_block = ""
     if needs_db_subnets:
         db_subnet_block = """
-  database_subnets             = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 20)]
+  database_subnets             = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 210)]
   create_database_subnet_group = true"""
 
     elasticache_block = ""
     if needs_elasticache_subnets:
         elasticache_block = """
-  elasticache_subnets = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 30)]"""
+  elasticache_subnets = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 220)]"""
 
     return f"""# ──────────────────────────────────────────────────────────────────────────────
 # VPC — auto-generated infrastructure layer
@@ -186,7 +186,7 @@ module "vpc" {{
 
   azs             = local.azs
   private_subnets = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]
-  public_subnets  = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 10)]{db_subnet_block}{elasticache_block}
+  public_subnets  = [for i, az in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 200)]{db_subnet_block}{elasticache_block}
 
   enable_nat_gateway   = true
   single_nat_gateway   = var.environment != "prod"
