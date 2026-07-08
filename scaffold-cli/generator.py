@@ -177,10 +177,6 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
          "description": "ACM certificate ARN for the HTTPS listener (TLS 1.2+)",
          "dev": "REPLACE_WITH_ACM_CERT_ARN", "staging": "REPLACE_WITH_ACM_CERT_ARN",
          "prod": "REPLACE_WITH_ACM_CERT_ARN"},
-        {"name": "alb_access_logs_bucket", "type": "string",
-         "description": "S3 bucket name for ALB access logs",
-         "dev": "REPLACE_WITH_LOG_BUCKET", "staging": "REPLACE_WITH_LOG_BUCKET",
-         "prod": "REPLACE_WITH_LOG_BUCKET"},
     ],
     "opensearch": [
         {"name": "opensearch_instance_type",  "type": "string",
@@ -762,7 +758,6 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
         ("security_group_id",      "string",       "aws_security_group.app.id"),
         ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
-        ("alb_access_logs_bucket", "string",       "var.alb_access_logs_bucket"),
     ],
     "lambda": [
         ("name_prefix",          "string",      '"${var.project_name}-${var.environment}"'),

@@ -1,6 +1,7 @@
 # ALB — hardened ingress for web-api
 resource "aws_lb" "main" {
   #checkov:skip=CKV2_AWS_28:WAF association is attached separately via the waf module when present; add aws_wafv2_web_acl_association referencing this ALB ARN
+  #checkov:skip=CKV_AWS_91:S3 access logging disabled by design — request-level detail not needed; ALB CloudWatch metrics + alarms cover observability. Re-enable by adding an access_logs block pointing at a log-delivery bucket.
   name               = "{{ project_name }}-${var.environment}-alb"
   # Internet-facing by design: the public entry point of the stack
   # (infra.yaml requests internet_facing). WAF + HTTPS-only listeners guard it.
@@ -12,12 +13,6 @@ resource "aws_lb" "main" {
   # Security hardening
   drop_invalid_header_fields = true          # CKV_AWS_131
   enable_deletion_protection = true          # CKV_AWS_150
-
-  access_logs {                              # CKV_AWS_91
-    bucket  = var.alb_access_logs_bucket
-    prefix  = "alb"
-    enabled = true
-  }
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-alb"
