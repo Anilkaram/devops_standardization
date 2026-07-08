@@ -1466,6 +1466,34 @@ resource "aws_kms_key" "main" {
         Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
         Action    = "kms:*"
         Resource  = "*"
+      },
+      # Auto Scaling launches instances with CMK-encrypted EBS volumes. Its
+      # service-linked role has NO KMS permissions of its own, so it must be
+      # granted in the key policy — otherwise instances terminate seconds
+      # after launch with Client.InvalidKMSKey.InvalidState.
+      {
+        Sid    = "AllowAutoScalingUseOfKey"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        }
+        Action = [
+          "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*",
+          "kms:GenerateDataKey*", "kms:DescribeKey"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowAutoScalingGrants"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        }
+        Action   = "kms:CreateGrant"
+        Resource = "*"
+        Condition = {
+          Bool = { "kms:GrantIsForAWSResource" = true }
+        }
       }
     ]
   })
