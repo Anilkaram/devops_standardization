@@ -3314,19 +3314,30 @@ def _write_env_files(
         # Build map(object) blocks
         obj_blocks: list[str] = []
 
-        # ── Custom IAM roles (modules/iam role factory) ──────────────────────
-        obj_blocks.append('''\
-# Custom IAM roles — add a role by adding one block here (no code change).
-iam_roles = {
-  # example_app_role = {
-  #   assume_role_services = ["ec2.amazonaws.com"]
-  #   managed_policy_arns  = ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
-  #   inline_policy = {
-  #     Version   = "2012-10-17"
-  #     Statement = [{ Effect = "Allow", Action = ["s3:GetObject"], Resource = "*" }]
-  #   }
-  # }
-}
+        # ── IAM roles ────────────────────────────────────────────────────────
+        # Every role in this map becomes a real IAM role via modules/iam, so the
+        # user can SEE and edit their roles here. The inventory comment also lists
+        # the roles this stack creates IN CODE (they cannot live in this map
+        # because other resources reference them by their Terraform address).
+        obj_blocks.append(f'''\
+# ── IAM roles ────────────────────────────────────────────────────────────────
+# Roles created IN CODE by this stack (referenced directly by other resources,
+# so they cannot live in the map below — listed here for full visibility):
+#   * {project_name}-{env_name}-ec2   instance role + profile  (security.tf)  -> used by ASG / EC2
+#   * {project_name}-{env_name}-rds-monitoring  enhanced-monitoring role (modules/rds) -> used by the DB
+#
+# Roles YOU control — each key below becomes module.iam.aws_iam_role.this[<key>].
+# Edit or delete the starter role; set iam_roles = {{}} to create none.
+iam_roles = {{
+  "{project_name}-{env_name}-app" = {{
+    assume_role_services = ["ec2.amazonaws.com"]
+    managed_policy_arns  = ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+    # inline_policy = {{
+    #   Version   = "2012-10-17"
+    #   Statement = [{{ Effect = "Allow", Action = ["s3:GetObject"], Resource = "*" }}]
+    # }}
+  }}
+}}
 ''')
 
         # ── S3 buckets map ────────────────────────────────────────────────────
