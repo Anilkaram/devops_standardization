@@ -1456,8 +1456,13 @@ provider "aws" {{
 resource "aws_s3_bucket" "tf_state" {{
   bucket = "{bucket_name}"
 
+  # Deletable by default so test projects can be fully torn down.
+  # PRODUCTION: set force_destroy = false and prevent_destroy = true so the
+  # state bucket (and its versioned state history) cannot be lost.
+  force_destroy = true
+
   lifecycle {{
-    prevent_destroy = true
+    prevent_destroy = false
   }}
 }}
 
@@ -1497,7 +1502,7 @@ resource "aws_dynamodb_table" "tf_locks" {{
   }}
 
   lifecycle {{
-    prevent_destroy = true
+    prevent_destroy = false  # PRODUCTION: set true to protect the lock table
   }}
 }}
 
