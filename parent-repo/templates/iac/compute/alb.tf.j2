@@ -12,7 +12,9 @@ resource "aws_lb" "main" {
 
   # Security hardening
   drop_invalid_header_fields = true          # CKV_AWS_131
-  enable_deletion_protection = true          # CKV_AWS_150
+  # Deletion protection only in prod — dev/uat stacks must be destroyable.
+  #checkov:skip=CKV_AWS_150:Deletion protection is environment-driven (true in prod)
+  enable_deletion_protection = var.environment == "prod"
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-alb"

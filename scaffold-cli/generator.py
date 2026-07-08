@@ -1099,7 +1099,7 @@ def _inject_s3_buckets_var(
                 "name":           f"{project_name}-{env_name}-{role}",
                 "versioning":     svc_cfg.get("versioning", True),
                 "lifecycle_days": svc_cfg.get("lifecycle_days", 90),
-                "force_destroy":  svc_cfg.get("force_destroy", False),
+                "force_destroy":  svc_cfg.get("force_destroy", env_name not in ("prod", "production", "live")),
             }
         env_defaults[env_name] = role_cfgs
 
