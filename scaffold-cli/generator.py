@@ -756,7 +756,9 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("environment",            "string",       "var.environment"),
         ("vpc_id",                 "string",       "module.vpc.vpc_id"),
         ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
-        ("security_group_id",      "string",       "aws_security_group.app.id"),
+        # Dedicated internet-facing SG (security.tf) — NOT the app SG, so the
+        # app tier stays reachable only from the ALB.
+        ("security_group_id",      "string",       "aws_security_group.alb.id"),
         ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
     ],
     "lambda": [
@@ -3677,6 +3679,8 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
             _stale.unlink()
         return
 
+    has_alb = "alb" in _bases
+
     blocks = [
         "# security.tf — shared app security group + IAM glue (root-level)",
         "# Referenced by modules (alb, ec2, autoscaling, rds, ...) via their inputs.",
@@ -3694,16 +3698,85 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
         "  }",
         "}",
         "",
-        "# HTTPS in from within the VPC (ALB → app). Adjust CIDRs as needed.",
-        'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
-        '  security_group_id = aws_security_group.app.id',
-        '  description       = "HTTPS from within the VPC"',
-        "  cidr_ipv4         = var.vpc_cidr",
-        "  from_port         = 443",
-        "  to_port           = 443",
-        '  ip_protocol       = "tcp"',
-        "}",
-        "",
+    ]
+
+    if has_alb:
+        # SG chaining: internet -> ALB SG (443/80 from anywhere, HTTPS-only listeners
+        # + WAF in front) -> app SG (reachable ONLY from the ALB SG, not the VPC).
+        blocks += [
+            "# Dedicated ALB security group — the ONLY internet-facing ingress in the stack.",
+            'resource "aws_security_group" "alb" {',
+            '  name_prefix = "${local.name_prefix}-alb-"',
+            '  description = "Internet-facing ALB ingress (HTTPS + redirect listener)"',
+            "  vpc_id      = module.vpc.vpc_id",
+            "",
+            "  tags = local.common_tags",
+            "",
+            "  lifecycle {",
+            "    create_before_destroy = true",
+            "  }",
+            "}",
+            "",
+            "# Public HTTPS — this is the stack's front door (WAF attaches to the ALB).",
+            'resource "aws_vpc_security_group_ingress_rule" "alb_https" {',
+            "  #tfsec:ignore:aws-ec2-no-public-ingress-sgr",
+            '  security_group_id = aws_security_group.alb.id',
+            '  description       = "Public HTTPS to the internet-facing ALB"',
+            '  cidr_ipv4         = "0.0.0.0/0"',
+            "  from_port         = 443",
+            "  to_port           = 443",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+            "# Public HTTP — immediately redirected to HTTPS by the ALB listener.",
+            'resource "aws_vpc_security_group_ingress_rule" "alb_http_redirect" {',
+            "  #tfsec:ignore:aws-ec2-no-public-ingress-sgr",
+            "  #checkov:skip=CKV_AWS_260:Port 80 only serves the HTTP->HTTPS redirect listener",
+            '  security_group_id = aws_security_group.alb.id',
+            '  description       = "Public HTTP, redirected to HTTPS"',
+            '  cidr_ipv4         = "0.0.0.0/0"',
+            "  from_port         = 80",
+            "  to_port           = 80",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+            'resource "aws_vpc_security_group_egress_rule" "alb_to_app" {',
+            '  security_group_id            = aws_security_group.alb.id',
+            '  description                  = "ALB to app targets (target-group port only)"',
+            "  referenced_security_group_id = aws_security_group.app.id",
+            "  from_port                    = 443",
+            "  to_port                      = 443",
+            '  ip_protocol                  = "tcp"',
+            "}",
+            "",
+            "# App tier accepts traffic ONLY from the ALB — not from the whole VPC —",
+            "# and only on the target-group port (443).",
+            'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+            '  security_group_id            = aws_security_group.app.id',
+            '  description                  = "HTTPS from the ALB security group only"',
+            "  referenced_security_group_id = aws_security_group.alb.id",
+            "  from_port                    = 443",
+            "  to_port                      = 443",
+            '  ip_protocol                  = "tcp"',
+            "}",
+            "",
+        ]
+    else:
+        blocks += [
+            "# HTTPS in from within the VPC. Adjust CIDRs as needed.",
+            'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+            '  security_group_id = aws_security_group.app.id',
+            '  description       = "HTTPS from within the VPC"',
+            "  cidr_ipv4         = var.vpc_cidr",
+            "  from_port         = 443",
+            "  to_port           = 443",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+        ]
+
+    blocks += [
+        "# Outbound: package repos, AWS APIs (SSM/Secrets/KMS), OS updates.",
         'resource "aws_vpc_security_group_egress_rule" "app_all" {',
         '  security_group_id = aws_security_group.app.id',
         '  description       = "Allow all outbound"',
