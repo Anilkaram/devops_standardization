@@ -61,6 +61,36 @@ def test_every_catalog_service_generates_a_real_module(tmp_path, monkeypatch):
     assert not empty, "Empty or placeholder modules generated:\n  " + "\n  ".join(empty)
 
 
+def test_serverless_stack_skips_vpc(tmp_path, monkeypatch):
+    """Pure serverless/managed stacks must not generate a VPC (no idle NAT cost)."""
+    catalog = dg.load_catalog()
+    config = {
+        "project": {"name": "no-vpc-test", "region": "us-east-1", "owner": "ci"},
+        "services": ["lambda", "api-gateway", "dynamodb", "s3", "cloudwatch"],
+        "environments": {"dev": {}},
+    }
+    monkeypatch.chdir(tmp_path)
+    generator.generate_scaffold(config, catalog, output_dir=str(tmp_path / ".infra"))
+    assert not (tmp_path / ".infra" / "networking.tf").exists(), \
+        "serverless stack generated a VPC it does not need"
+    # and no dangling module.vpc references anywhere at root
+    for tf in (tmp_path / ".infra").glob("*.tf"):
+        assert "module.vpc" not in tf.read_text(encoding="utf-8"), f"dangling vpc ref in {tf.name}"
+
+
+def test_network_stack_keeps_vpc(tmp_path, monkeypatch):
+    """Network-attached services (ec2/rds/alb) must still generate the VPC."""
+    catalog = dg.load_catalog()
+    config = {
+        "project": {"name": "vpc-test", "region": "us-east-1", "owner": "ci"},
+        "services": ["ec2", "rds", "kms"],
+        "environments": {"dev": {}},
+    }
+    monkeypatch.chdir(tmp_path)
+    generator.generate_scaffold(config, catalog, output_dir=str(tmp_path / ".infra"))
+    assert (tmp_path / ".infra" / "networking.tf").exists()
+
+
 def test_root_wires_every_module(tmp_path, monkeypatch):
     """Every generated module must be referenced from the root main.tf."""
     catalog  = dg.load_catalog()

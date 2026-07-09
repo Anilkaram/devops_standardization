@@ -30,7 +30,7 @@ resource "aws_cloudwatch_event_bus" "main" {
   description = "{{ project_name }} ${var.environment} custom event bus"
 
   {% if 'kms' in services %}
-  kms_key_identifier = try(aws_kms_key.main.arn, null)
+  kms_key_identifier = var.kms_key_arn
   {% endif %}
 
   {% if 'sqs' in services %}

@@ -445,9 +445,29 @@ def generate_scaffold(
     _write_provider_tf(base, project_name, region, owner, catalog)
 
     # "" networking.tf (VPC) """""""""""""""""""""""""""""""""""""""""""""""
-    vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
-    (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
-    typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+    # Only network-attached services need a VPC. Static sites and pure
+    # serverless/managed stacks (lambda, api-gateway, dynamodb, s3, sqs, ...)
+    # skip it entirely — no idle NAT gateway cost, smaller attack surface.
+    _VPC_CONSUMERS = {
+        "ec2", "autoscaling", "alb", "eks", "ecs-fargate",
+        "rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql",
+        "redis", "memcached", "opensearch", "documentdb", "msk", "efs",
+    }
+    _svc_bases = {dg._base_svc(s, catalog) or s for s in services}
+    needs_vpc = bool(_VPC_CONSUMERS & _svc_bases)
+    ctx["needs_vpc"] = needs_vpc
+    if needs_vpc:
+        vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
+        (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
+        typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+    else:
+        _stale_net = base / "networking.tf"
+        if _stale_net.exists():
+            _stale_net.unlink()
+        typer.secho(
+            "  ~ Skipping VPC — no network-attached services (serverless/static stack).",
+            fg=typer.colors.CYAN,
+        )
 
     # "" security.tf (shared app security group + optional EC2 instance profile) ""
     # Many modules (alb, ec2, autoscaling, rds, ...) need a shared security group
@@ -2565,7 +2585,11 @@ def _prune_absent_module_refs(main_tf_path: Path, modules_dir: Path) -> None:
     import re
     if not main_tf_path.exists():
         return
-    present = {"vpc"}
+    present = set()
+    # vpc lives in networking.tf (registry module), generated only when a
+    # network-attached service exists.
+    if (main_tf_path.parent / "networking.tf").exists():
+        present.add("vpc")
     if modules_dir.exists():
         present |= {p.name for p in modules_dir.iterdir() if p.is_dir()}
 
