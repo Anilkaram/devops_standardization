@@ -2812,6 +2812,7 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
         "region":             "var.region",
         "name_prefix":        '"${var.project_name}-${var.environment}"',
         "kms_key_arn":        "try(module.kms.key_arn, null)",
+        "waf_web_acl_arn":    "try(module.waf.waf_acl_arn, null)",
         "vpc_id":             "module.vpc.vpc_id",
         "private_subnet_ids": "module.vpc.private_subnets",
         "public_subnet_ids":  "module.vpc.public_subnets",
