@@ -1690,7 +1690,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
     for k, v in var.cloudwatch_alarms.lambdas : k => v if lookup(v, "enabled", true)
   }
 
-  alarm_name          = "${each.value.name}_errors"
+  alarm_name          = "${each.value.name}-errors"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 5
   metric_name         = "Errors"
@@ -1709,7 +1709,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
     for k, v in var.cloudwatch_alarms.sqs : k => v if lookup(v, "enabled", true)
   }
 
-  alarm_name          = "${each.value.name}_backlog"
+  alarm_name          = "${each.value.name}-backlog"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "ApproximateNumberOfMessagesVisible"
@@ -3484,7 +3484,7 @@ ecr_repositories = {{
 # Add a new secret by adding one block inside secrets.
 secrets = {{
   app_secrets = {{
-    name                    = "{project_name}/{env_name}/app"
+    name                    = "{project_name}-{env_name}-app-secrets"
     description             = "Application secrets for {project_name} ({env_name})"
     recovery_window_in_days = {rw}
   }}

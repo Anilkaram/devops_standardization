@@ -552,7 +552,7 @@ def generate_iam_policy_block(
 # IAM policy — {compute_service} → connected services (auto-generated)
 # ──────────────────────────────────────────────────────────────────────────────
 resource "aws_iam_policy" "{compute_service.replace('-', '_')}_service_access" {{
-  name        = "${{var.project_name}}-{compute_service}-access-${{var.environment}}"
+  name        = "${{var.project_name}}-${{var.environment}}-{compute_service}-access"
   description = "Least-privilege access for {compute_service} to connected services"
 
   policy = jsonencode({{
