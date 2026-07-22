@@ -887,44 +887,69 @@ def _scan_tfvars_for_secrets(infra_dir: Path) -> int:
     """Warn about plaintext secret patterns in tfvars. Returns finding count."""
     import re as _re
     _SECRET_PATTERNS = [
-        r'(?i)(password|passwd|secret|api_key|api-key|token|private_key)\s*=\s*"[^"]{6,}"',
-        r'(?i)(aws_access_key_id|aws_secret_access_key)\s*=\s*"[^"]{10,}"',
+        # Key may be bare (db_password = "x") or quoted ("DB_PASSWORD" = "x").
+        r'(?i)"?(password|passwd|secret|api_key|api-key|token|private_key)"?\s*=\s*"[^"]{6,}"',
+        r'(?i)"?(aws_access_key_id|aws_secret_access_key)"?\s*=\s*"[^"]{10,}"',
     ]
     _SAFE_PLACEHOLDERS = {"REPLACE_WITH", "your-", "example", "PLACEHOLDER", "TODO", "changeme"}
+    # Metadata keys inside the secrets map whose string values are not credentials.
+    _SECRETS_META_KEYS = {"name", "description", "recovery_window_in_days", "kms_key_id"}
 
     def _is_placeholder(text: str) -> bool:
         return any(p.lower() in text.lower() for p in _SAFE_PLACEHOLDERS)
 
+    def _strip_comment(line: str) -> str:
+        # Drop a trailing # comment, but only outside quotes — a # inside a
+        # quoted value (e.g. password = "ab#cd") is part of the value.
+        in_str = False
+        for idx, ch in enumerate(line):
+            if ch == '"':
+                in_str = not in_str
+            elif ch == "#" and not in_str:
+                return line[:idx]
+        return line
+
     found = []
     for tfvars in infra_dir.rglob("terraform.tfvars"):
         content = tfvars.read_text(encoding="utf-8", errors="ignore")
-        for pattern in _SECRET_PATTERNS:
-            for match in _re.finditer(pattern, content):
-                value = match.group(0)
-                if not _is_placeholder(value):
-                    found.append((tfvars.relative_to(infra_dir), value[:60]))
-
-        # Block-aware scan: inside the `secrets = {` map, ANY quoted `value`
-        # is a real credential regardless of its key name.
         lines = content.splitlines()
+
+        # Block-aware scan: inside the `secrets = {` map, ANY string assigned
+        # to a non-metadata key is a credential regardless of the key's name
+        # (covers values = { "DB_PASSWORD" = "..." } and friends).
+        secrets_block_lines: set[int] = set()
         depth = 0            # brace depth relative to the secrets block
         in_secrets = False
         for i, line in enumerate(lines, 1):
-            stripped = line.split("#", 1)[0]   # ignore comments
+            stripped = _strip_comment(line)
             if not in_secrets:
                 if _re.match(r'\s*secrets\s*=\s*\{', stripped):
                     in_secrets = True
                     depth = stripped.count("{") - stripped.count("}")
                 continue
+            secrets_block_lines.add(i)
             depth += stripped.count("{") - stripped.count("}")
-            m = _re.search(r'\bvalue\s*=\s*"([^"]+)"', stripped)
-            if m and not _is_placeholder(m.group(1)):
+            m = _re.search(r'"?([A-Za-z0-9_\-]+)"?\s*=\s*"([^"]+)"', stripped)
+            if m and m.group(1).lower() not in _SECRETS_META_KEYS \
+                    and not _is_placeholder(m.group(2)):
                 found.append((
                     tfvars.relative_to(infra_dir),
-                    f'line {i}: secrets map contains a plaintext value = "{m.group(1)[:20]}..."',
+                    f'line {i}: secrets map contains a plaintext {m.group(1)} = "{m.group(2)[:20]}..."',
                 ))
             if depth <= 0:
                 in_secrets = False
+
+        # Keyword scan for secret-looking keys anywhere else in the file.
+        # Lines inside the secrets block were already judged above — skip them
+        # so one credential isn't reported twice.
+        for pattern in _SECRET_PATTERNS:
+            for match in _re.finditer(pattern, content):
+                line_no = content.count("\n", 0, match.start()) + 1
+                if line_no in secrets_block_lines:
+                    continue
+                value = match.group(0)
+                if not _is_placeholder(value):
+                    found.append((tfvars.relative_to(infra_dir), value[:60]))
 
     if found:
         typer.secho("\n! SECRET SCAN WARNING", fg=typer.colors.RED, bold=True)
