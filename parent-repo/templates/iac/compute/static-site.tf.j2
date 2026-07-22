@@ -29,6 +29,9 @@ resource "aws_s3_bucket_versioning" "{{ pn }}_site" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "{{ pn }}_site" {
+  # Public static assets: SSE-AES256 is sufficient — a CMK adds cost and key
+  # management with no confidentiality gain for content served publicly.
+  #tfsec:ignore:aws-s3-encryption-customer-key
   bucket = aws_s3_bucket.{{ pn }}_site.id
   rule {
     apply_server_side_encryption_by_default {
@@ -56,7 +59,11 @@ resource "aws_cloudfront_distribution" "site" {
 
   {% if 'waf' in services %}
   # WAF connection: waf -> static-site (from infra.yaml connections)
-  web_acl_id = aws_wafv2_web_acl.main.arn
+  web_acl_id = var.waf_web_acl_arn
+  {% else %}
+  # No WAF in this stack — public static content only. Add 'waf' to services
+  # in infra.yaml to front this distribution with managed rule sets.
+  #tfsec:ignore:aws-cloudfront-enable-waf
   {% endif %}
 
   origin {

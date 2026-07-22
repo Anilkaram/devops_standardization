@@ -254,6 +254,7 @@ def _ask_project_type(config: dict, dp: Path) -> dict:
             ("chatbot",       "Conversational UI + AI backend (LLM/RAG). Full-stack AI app."),
             ("data-pipeline", "ETL/batch/streaming. ECS Fargate + EventBridge + S3/Redshift."),
             ("ai-service",    "AI-native backend service. No UI — API only with LLM integration."),
+            ("custom",        "None of the above — pick compute and services yourself from the full catalog."),
         ],
     )
     config.setdefault("project", {})["type"] = val
@@ -264,6 +265,7 @@ def _ask_project_type(config: dict, dp: Path) -> dict:
         "chatbot":       "Conversational UI with AI backend — static-site + backend + Bedrock/LLM.",
         "data-pipeline": "Moves/transforms/loads data on schedule or event trigger.",
         "ai-service":    "LLM-backed API — no UI, backend-only AI service.",
+        "custom":        "No preset architecture — user selects services from the catalog.",
     }
     _log_and_echo("project.type", val, "interactive prompt", reasons[val], decisions_path=dp)
     return config
@@ -645,6 +647,44 @@ def _ask_data_stores(config: dict, dp: Path) -> dict:
     ptype = config.get("project", {}).get("type", "")
     if ptype == "frontend":
         return config  # no data stores for static sites
+
+    if ptype == "custom":
+        # No preset architecture — offer the FULL catalog (minus compute, which
+        # the compute prompt already covered, and infra layers, which are
+        # auto-generated when needed).
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "dynamic_generator", Path(__file__).parent / "dynamic_generator.py")
+            _dg = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_dg)
+            _catalog = _dg.load_catalog()
+            _compute = _dg.get_compute_services(_catalog) | {"static-site"}
+            _infra   = _dg.get_infra_layer_names(_catalog)
+            options = sorted(
+                s for s in _catalog.get("services", {})
+                if s not in _compute and s not in _infra
+            )
+        except Exception:
+            options = [
+                "postgres", "mysql", "redis", "s3", "dynamodb", "sqs", "sns",
+                "eventbridge", "opensearch", "kinesis", "msk", "kms",
+                "secrets-manager", "cloudwatch", "ecr", "cognito", "waf",
+                "cloudfront", "api-gateway", "bedrock",
+            ]
+        chosen = _prompt_multiselect(
+            "Which services does this project use? (full catalog)",
+            options,
+            hint="Enter comma-separated numbers, or leave blank if none",
+        )
+        if chosen:
+            svcs = config.setdefault("services", [])
+            for c in chosen:
+                if c not in svcs:
+                    svcs.append(c)
+            _log_and_echo("services", ", ".join(chosen), "interactive prompt",
+                          "Custom project — services picked directly from the catalog.",
+                          decisions_path=dp)
+        return config
 
     STORE_OPTIONS = [
         "postgres", "mysql", "redis", "s3", "dynamodb",

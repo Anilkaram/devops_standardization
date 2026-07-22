@@ -1,5 +1,5 @@
 # Outputs — surfaces key resource identifiers for CI/CD and operators
-{% if 'static-site' not in services %}
+{% if needs_vpc | default(true) %}
 output "vpc_id" {
   description = "VPC ID"
   value       = module.vpc.vpc_id

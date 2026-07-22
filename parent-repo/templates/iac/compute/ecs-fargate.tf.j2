@@ -10,7 +10,7 @@ resource "aws_ecs_cluster" "main" {
 
   configuration {
     execute_command_configuration {
-      kms_key_id = try(aws_kms_key.main.arn, null)
+      kms_key_id = var.kms_key_arn
       logging    = "OVERRIDE"
       log_configuration {
         cloud_watch_encryption_enabled = true
@@ -28,7 +28,7 @@ resource "aws_ecs_cluster" "main" {
 resource "aws_cloudwatch_log_group" "ecs_exec" {
   name              = "/ecs/exec/{{ project_name }}-${var.environment}"
   retention_in_days = lookup(local.log_retention_days, var.environment, 30)
-  kms_key_id        = try(aws_kms_key.main.arn, null)
+  kms_key_id        = var.kms_key_arn
 
   tags = {
     Name        = "{{ project_name }}-${var.environment}-ecs-exec-logs"

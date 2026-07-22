@@ -860,6 +860,10 @@ def _run_tfsec_scan(infra_dir: Path) -> tuple[bool, str]:
         return False, "tfsec timed out (>300s)"
     output = r.stdout + r.stderr
 
+    # tfsec embeds version-pinned doc links (…/tfsec/v1.28.x/checks/…) that 404
+    # since the docs moved under /latest/ after the Trivy merge. Rewrite them.
+    output = _re.sub(r"(aquasecurity\.github\.io/tfsec/)v[\d.]+/", r"\1latest/", output)
+
     # tfsec summary: "critical: N high: N medium: N low: N" (in "N potential problems" block)
     counts = dict(_re.findall(r"(critical|high|medium|low)\s*:?\s*(\d+)", output, _re.IGNORECASE))
     crit = int(counts.get("critical", counts.get("CRITICAL", 0)))

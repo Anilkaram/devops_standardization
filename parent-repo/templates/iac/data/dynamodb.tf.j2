@@ -49,7 +49,7 @@ resource "aws_dynamodb_table" "main" {
   # Server-side encryption with CMK when KMS is in the stack
   server_side_encryption {
     enabled     = true
-    kms_key_arn = try(aws_kms_key.main.arn, null)
+    kms_key_arn = var.kms_key_arn
   }
 
   # Prevent accidental table deletion

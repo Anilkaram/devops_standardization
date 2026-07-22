@@ -445,9 +445,29 @@ def generate_scaffold(
     _write_provider_tf(base, project_name, region, owner, catalog)
 
     # "" networking.tf (VPC) """""""""""""""""""""""""""""""""""""""""""""""
-    vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
-    (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
-    typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+    # Only network-attached services need a VPC. Static sites and pure
+    # serverless/managed stacks (lambda, api-gateway, dynamodb, s3, sqs, ...)
+    # skip it entirely — no idle NAT gateway cost, smaller attack surface.
+    _VPC_CONSUMERS = {
+        "ec2", "autoscaling", "alb", "eks", "ecs-fargate",
+        "rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql",
+        "redis", "memcached", "opensearch", "documentdb", "msk", "efs",
+    }
+    _svc_bases = {dg._base_svc(s, catalog) or s for s in services}
+    needs_vpc = bool(_VPC_CONSUMERS & _svc_bases)
+    ctx["needs_vpc"] = needs_vpc
+    if needs_vpc:
+        vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
+        (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
+        typer.secho("  + networking.tf  [vpc module]", fg=typer.colors.GREEN)
+    else:
+        _stale_net = base / "networking.tf"
+        if _stale_net.exists():
+            _stale_net.unlink()
+        typer.secho(
+            "  ~ Skipping VPC — no network-attached services (serverless/static stack).",
+            fg=typer.colors.CYAN,
+        )
 
     # "" security.tf (shared app security group + optional EC2 instance profile) ""
     # Many modules (alb, ec2, autoscaling, rds, ...) need a shared security group
@@ -756,7 +776,9 @@ _MODULE_VARS: dict[str, list[tuple[str, str, str]]] = {
         ("environment",            "string",       "var.environment"),
         ("vpc_id",                 "string",       "module.vpc.vpc_id"),
         ("public_subnet_ids",      "list(string)", "module.vpc.public_subnets"),
-        ("security_group_id",      "string",       "aws_security_group.app.id"),
+        # Dedicated internet-facing SG (security.tf) — NOT the app SG, so the
+        # app tier stays reachable only from the ALB.
+        ("security_group_id",      "string",       "aws_security_group.alb.id"),
         ("alb_certificate_arn",    "string",       "var.alb_certificate_arn"),
     ],
     "lambda": [
@@ -935,6 +957,9 @@ def _write_module_dir(
 
 
 def _default_module_outputs(mod_name: str) -> str:
+    # Shared outputs table first (single source of truth for module surfaces)
+    if mod_name in _MODULE_OUTPUTS_TF:
+        return _MODULE_OUTPUTS_TF[mod_name]
     templates = {
         "lambda": (
             'output "function_name" {\n'
@@ -1668,7 +1693,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
     for k, v in var.cloudwatch_alarms.lambdas : k => v if lookup(v, "enabled", true)
   }
 
-  alarm_name          = "${each.value.name}_errors"
+  alarm_name          = "${each.value.name}-errors"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 5
   metric_name         = "Errors"
@@ -1687,7 +1712,7 @@ resource "aws_cloudwatch_metric_alarm" "sqs_backlog" {
     for k, v in var.cloudwatch_alarms.sqs : k => v if lookup(v, "enabled", true)
   }
 
-  alarm_name          = "${each.value.name}_backlog"
+  alarm_name          = "${each.value.name}-backlog"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "ApproximateNumberOfMessagesVisible"
@@ -2516,6 +2541,23 @@ output "instance_arn" {
 }
 ''',
 
+    "alb": '''\
+output "target_group_arn" {
+  description = "ALB target group ARN — pass to autoscaling target_group_arns"
+  value       = aws_lb_target_group.app.arn
+}
+
+output "alb_dns_name" {
+  description = "Public DNS name of the load balancer"
+  value       = aws_lb.main.dns_name
+}
+
+output "alb_arn" {
+  description = "ALB ARN (WAF association, alarms)"
+  value       = aws_lb.main.arn
+}
+''',
+
     "cognito": '''\
 output "user_pool_id" {
   description = "Cognito user pool ID"
@@ -2563,7 +2605,11 @@ def _prune_absent_module_refs(main_tf_path: Path, modules_dir: Path) -> None:
     import re
     if not main_tf_path.exists():
         return
-    present = {"vpc"}
+    present = set()
+    # vpc lives in networking.tf (registry module), generated only when a
+    # network-attached service exists.
+    if (main_tf_path.parent / "networking.tf").exists():
+        present.add("vpc")
     if modules_dir.exists():
         present |= {p.name for p in modules_dir.iterdir() if p.is_dir()}
 
@@ -2639,6 +2685,7 @@ def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -
         "name_prefix":        ("string", None),
         "tags":               ("map(string)", "{}"),
         "log_retention_days": ("number", "365"),
+        "target_group_arns":  ("list(string)", "[]"),
     }
     for vname in auto_declared:
         vtype, vdefault = _AUTOVAR_TYPES.get(vname, ("string", "null"))
@@ -2771,6 +2818,7 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'  security_group_id     = aws_security_group.app.id\n'
             f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
             f'  instance_profile_name = aws_iam_instance_profile.ec2.name\n'
+            f'  target_group_arns     = compact([try(module.alb.target_group_arn, "")])\n'
             f'  tags                  = local.common_tags\n'
             f'}}\n'
         )
@@ -2786,6 +2834,7 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
         "region":             "var.region",
         "name_prefix":        '"${var.project_name}-${var.environment}"',
         "kms_key_arn":        "try(module.kms.key_arn, null)",
+        "waf_web_acl_arn":    "try(module.waf.waf_acl_arn, null)",
         "vpc_id":             "module.vpc.vpc_id",
         "private_subnet_ids": "module.vpc.private_subnets",
         "public_subnet_ids":  "module.vpc.public_subnets",
@@ -3457,7 +3506,7 @@ ecr_repositories = {{
 # Add a new secret by adding one block inside secrets.
 secrets = {{
   app_secrets = {{
-    name                    = "{project_name}/{env_name}/app"
+    name                    = "{project_name}-{env_name}-app-secrets"
     description             = "Application secrets for {project_name} ({env_name})"
     recovery_window_in_days = {rw}
   }}
@@ -3677,6 +3726,8 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
             _stale.unlink()
         return
 
+    has_alb = "alb" in _bases
+
     blocks = [
         "# security.tf — shared app security group + IAM glue (root-level)",
         "# Referenced by modules (alb, ec2, autoscaling, rds, ...) via their inputs.",
@@ -3694,16 +3745,85 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
         "  }",
         "}",
         "",
-        "# HTTPS in from within the VPC (ALB → app). Adjust CIDRs as needed.",
-        'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
-        '  security_group_id = aws_security_group.app.id',
-        '  description       = "HTTPS from within the VPC"',
-        "  cidr_ipv4         = var.vpc_cidr",
-        "  from_port         = 443",
-        "  to_port           = 443",
-        '  ip_protocol       = "tcp"',
-        "}",
-        "",
+    ]
+
+    if has_alb:
+        # SG chaining: internet -> ALB SG (443/80 from anywhere, HTTPS-only listeners
+        # + WAF in front) -> app SG (reachable ONLY from the ALB SG, not the VPC).
+        blocks += [
+            "# Dedicated ALB security group — the ONLY internet-facing ingress in the stack.",
+            'resource "aws_security_group" "alb" {',
+            '  name_prefix = "${local.name_prefix}-alb-"',
+            '  description = "Internet-facing ALB ingress (HTTPS + redirect listener)"',
+            "  vpc_id      = module.vpc.vpc_id",
+            "",
+            "  tags = local.common_tags",
+            "",
+            "  lifecycle {",
+            "    create_before_destroy = true",
+            "  }",
+            "}",
+            "",
+            "# Public HTTPS — this is the stack's front door (WAF attaches to the ALB).",
+            'resource "aws_vpc_security_group_ingress_rule" "alb_https" {',
+            "  #tfsec:ignore:aws-ec2-no-public-ingress-sgr",
+            '  security_group_id = aws_security_group.alb.id',
+            '  description       = "Public HTTPS to the internet-facing ALB"',
+            '  cidr_ipv4         = "0.0.0.0/0"',
+            "  from_port         = 443",
+            "  to_port           = 443",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+            "# Public HTTP — immediately redirected to HTTPS by the ALB listener.",
+            'resource "aws_vpc_security_group_ingress_rule" "alb_http_redirect" {',
+            "  #tfsec:ignore:aws-ec2-no-public-ingress-sgr",
+            "  #checkov:skip=CKV_AWS_260:Port 80 only serves the HTTP->HTTPS redirect listener",
+            '  security_group_id = aws_security_group.alb.id',
+            '  description       = "Public HTTP, redirected to HTTPS"',
+            '  cidr_ipv4         = "0.0.0.0/0"',
+            "  from_port         = 80",
+            "  to_port           = 80",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+            'resource "aws_vpc_security_group_egress_rule" "alb_to_app" {',
+            '  security_group_id            = aws_security_group.alb.id',
+            '  description                  = "ALB to app targets (target-group port only)"',
+            "  referenced_security_group_id = aws_security_group.app.id",
+            "  from_port                    = 443",
+            "  to_port                      = 443",
+            '  ip_protocol                  = "tcp"',
+            "}",
+            "",
+            "# App tier accepts traffic ONLY from the ALB — not from the whole VPC —",
+            "# and only on the target-group port (443).",
+            'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+            '  security_group_id            = aws_security_group.app.id',
+            '  description                  = "HTTPS from the ALB security group only"',
+            "  referenced_security_group_id = aws_security_group.alb.id",
+            "  from_port                    = 443",
+            "  to_port                      = 443",
+            '  ip_protocol                  = "tcp"',
+            "}",
+            "",
+        ]
+    else:
+        blocks += [
+            "# HTTPS in from within the VPC. Adjust CIDRs as needed.",
+            'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+            '  security_group_id = aws_security_group.app.id',
+            '  description       = "HTTPS from within the VPC"',
+            "  cidr_ipv4         = var.vpc_cidr",
+            "  from_port         = 443",
+            "  to_port           = 443",
+            '  ip_protocol       = "tcp"',
+            "}",
+            "",
+        ]
+
+    blocks += [
+        "# Outbound: package repos, AWS APIs (SSM/Secrets/KMS), OS updates.",
         'resource "aws_vpc_security_group_egress_rule" "app_all" {',
         '  security_group_id = aws_security_group.app.id',
         '  description       = "Allow all outbound"',
