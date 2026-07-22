@@ -65,6 +65,12 @@ resource "aws_autoscaling_group" "app" {
   max_size            = var.asg_max_size
   desired_capacity    = var.asg_desired_capacity
 
+  # Registers instances with the ALB target group when an alb is in the stack
+  # (root passes try([module.alb.target_group_arn], [])).
+  target_group_arns = var.target_group_arns
+
+  # EC2 health checks: a fresh AMI has no app listening yet, so ELB checks
+  # would never pass. Switch to "ELB" once user_data installs the app.
   health_check_type         = "EC2"
   health_check_grace_period = 300
 

@@ -957,6 +957,9 @@ def _write_module_dir(
 
 
 def _default_module_outputs(mod_name: str) -> str:
+    # Shared outputs table first (single source of truth for module surfaces)
+    if mod_name in _MODULE_OUTPUTS_TF:
+        return _MODULE_OUTPUTS_TF[mod_name]
     templates = {
         "lambda": (
             'output "function_name" {\n'
@@ -2538,6 +2541,23 @@ output "instance_arn" {
 }
 ''',
 
+    "alb": '''\
+output "target_group_arn" {
+  description = "ALB target group ARN — pass to autoscaling target_group_arns"
+  value       = aws_lb_target_group.app.arn
+}
+
+output "alb_dns_name" {
+  description = "Public DNS name of the load balancer"
+  value       = aws_lb.main.dns_name
+}
+
+output "alb_arn" {
+  description = "ALB ARN (WAF association, alarms)"
+  value       = aws_lb.main.arn
+}
+''',
+
     "cognito": '''\
 output "user_pool_id" {
   description = "Cognito user pool ID"
@@ -2665,6 +2685,7 @@ def _write_service_module(modules_dir: Path, svc: str, rendered_hcl: str = "") -
         "name_prefix":        ("string", None),
         "tags":               ("map(string)", "{}"),
         "log_retention_days": ("number", "365"),
+        "target_group_arns":  ("list(string)", "[]"),
     }
     for vname in auto_declared:
         vtype, vdefault = _AUTOVAR_TYPES.get(vname, ("string", "null"))
@@ -2797,6 +2818,7 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'  security_group_id     = aws_security_group.app.id\n'
             f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
             f'  instance_profile_name = aws_iam_instance_profile.ec2.name\n'
+            f'  target_group_arns     = compact([try(module.alb.target_group_arn, "")])\n'
             f'  tags                  = local.common_tags\n'
             f'}}\n'
         )
