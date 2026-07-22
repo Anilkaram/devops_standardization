@@ -456,6 +456,26 @@ def generate_scaffold(
     _svc_bases = {dg._base_svc(s, catalog) or s for s in services}
     needs_vpc = bool(_VPC_CONSUMERS & _svc_bases)
     ctx["needs_vpc"] = needs_vpc
+
+    # ── ALB target-group wiring ─────────────────────────────────────────────
+    # ASG/EC2 targets register by instance ID; ECS Fargate tasks register by IP
+    # (an ASG cannot attach to an "ip" target group — CreateAutoScalingGroup
+    # fails with "invalid target type"). Port/protocol honour the infra.yaml
+    # alb.target_group spec; instance targets default to plain HTTP 80 since
+    # TLS terminates at the ALB listener and instances carry no certificates.
+    _alb_spec = next(
+        (s for s in config.get("service_instances", [])
+         if isinstance(s, dict) and s.get("type") == "alb"),
+        {},
+    )
+    _tg_spec = _alb_spec.get("target_group") or {}
+    _instance_targets = bool({"ec2", "autoscaling"} & _svc_bases) and "ecs-fargate" not in _svc_bases
+    _tg_port_default, _tg_proto_default = (80, "HTTP") if _instance_targets else (443, "HTTPS")
+    alb_target_port = int(_tg_spec.get("port", _tg_port_default))
+    ctx["alb_target_type"]       = "instance" if _instance_targets else "ip"
+    ctx["alb_target_port"]       = alb_target_port
+    ctx["alb_target_protocol"]   = str(_tg_spec.get("protocol", _tg_proto_default)).upper()
+    ctx["alb_health_check_path"] = _tg_spec.get("health_check_path", "/health")
     if needs_vpc:
         vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
         (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
@@ -473,7 +493,7 @@ def generate_scaffold(
     # Many modules (alb, ec2, autoscaling, rds, ...) need a shared security group
     # and EC2 instances need an instance profile. Create them once at root and pass
     # them into the modules as inputs.
-    _write_shared_glue(base, services, compute_list)
+    _write_shared_glue(base, services, compute_list, alb_target_port)
 
     # "" main.tf (compute) " from catalog templates """""""""""""""""""""""""
     compute_templates = []
@@ -3699,7 +3719,9 @@ def _write_secrets_policy(base: Path, project_name: str, data_stores: list) -> N
 # .gitignore
 # """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
+def _write_shared_glue(
+    base: Path, services: list, compute_list: list, alb_target_port: int = 443
+) -> None:
     """Write security.tf: shared app security group + optional EC2 instance profile.
 
     These are root-level resources referenced by many modules. The app security
@@ -3727,6 +3749,9 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
         return
 
     has_alb = "alb" in _bases
+    # Rule label/description track the target-group port (80 = TLS ends at ALB).
+    _app_rule_name  = "app_https" if alb_target_port == 443 else "app_http"
+    _app_rule_proto = "HTTPS" if alb_target_port == 443 else "HTTP"
 
     blocks = [
         "# security.tf — shared app security group + IAM glue (root-level)",
@@ -3791,19 +3816,19 @@ def _write_shared_glue(base: Path, services: list, compute_list: list) -> None:
             '  security_group_id            = aws_security_group.alb.id',
             '  description                  = "ALB to app targets (target-group port only)"',
             "  referenced_security_group_id = aws_security_group.app.id",
-            "  from_port                    = 443",
-            "  to_port                      = 443",
+            f"  from_port                    = {alb_target_port}",
+            f"  to_port                      = {alb_target_port}",
             '  ip_protocol                  = "tcp"',
             "}",
             "",
             "# App tier accepts traffic ONLY from the ALB — not from the whole VPC —",
-            "# and only on the target-group port (443).",
-            'resource "aws_vpc_security_group_ingress_rule" "app_https" {',
+            f"# and only on the target-group port ({alb_target_port}; TLS terminates at the ALB).",
+            f'resource "aws_vpc_security_group_ingress_rule" "{_app_rule_name}" {{',
             '  security_group_id            = aws_security_group.app.id',
-            '  description                  = "HTTPS from the ALB security group only"',
+            f'  description                  = "{_app_rule_proto} from the ALB security group only"',
             "  referenced_security_group_id = aws_security_group.alb.id",
-            "  from_port                    = 443",
-            "  to_port                      = 443",
+            f"  from_port                    = {alb_target_port}",
+            f"  to_port                      = {alb_target_port}",
             '  ip_protocol                  = "tcp"',
             "}",
             "",

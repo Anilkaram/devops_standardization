@@ -24,14 +24,16 @@ resource "aws_lb" "main" {
 
 resource "aws_lb_target_group" "app" {
   name        = "{{ project_name }}-${var.environment}-tg"
-  port        = 443
-  protocol    = "HTTPS"
+  # ASG/EC2 stacks register targets by instance ID; ECS Fargate tasks by IP.
+  # TLS terminates at the ALB listener; port/protocol follow infra.yaml.
+  port        = {{ alb_target_port }}
+  protocol    = "{{ alb_target_protocol }}"
   vpc_id      = var.vpc_id
-  target_type = "ip"
+  target_type = "{{ alb_target_type }}"
 
   health_check {
-    path                = "/health"
-    protocol            = "HTTPS"
+    path                = "{{ alb_health_check_path }}"
+    protocol            = "{{ alb_target_protocol }}"
     matcher             = "200"
     interval            = 30
     healthy_threshold   = 2
