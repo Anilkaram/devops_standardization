@@ -81,6 +81,9 @@ resource "aws_db_instance" "main" {
   # Use the latest recommended CA certificate
   ca_cert_identifier = "rds-ca-rsa2048-g1"
 
+  # Deletion protection is environment-driven: enforced in prod, off in
+  # dev/uat so test stacks stay destroyable.
+  #tfsec:ignore:aws-rds-enable-deletion-protection
   deletion_protection = var.environment == "prod" ? true : false
   skip_final_snapshot = var.environment != "prod"
 

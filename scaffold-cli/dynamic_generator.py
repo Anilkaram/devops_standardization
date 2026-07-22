@@ -193,6 +193,13 @@ module "vpc" {{
   enable_dns_hostnames = true
   enable_dns_support   = true
 
+  # VPC Flow Logs -> CloudWatch (aws-ec2-require-vpc-flow-logs-for-all-vpcs)
+  enable_flow_log                                 = true
+  create_flow_log_cloudwatch_log_group            = true
+  create_flow_log_cloudwatch_iam_role             = true
+  flow_log_max_aggregation_interval               = 60
+  flow_log_cloudwatch_log_group_retention_in_days = 365
+
   public_subnet_tags = {{
     "kubernetes.io/role/elb" = 1
   }}

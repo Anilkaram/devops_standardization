@@ -24,6 +24,14 @@ jobs:
         run: |
           pip install checkov
           checkov -d .infra/iac/ --framework terraform
+      - name: tfsec security scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: .infra/iac/
+          # Downloaded registry modules (.terraform/modules) carry upstream
+          # findings we cannot fix (e.g. VPC default-NACL rules) — scan our
+          # own code only so real regressions stay visible.
+          additional_args: --exclude-downloaded-modules
 <% if compute_target == 'eks' %>
   build-push:
     name: Build & Push to ECR
