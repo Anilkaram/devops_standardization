@@ -55,6 +55,12 @@ def _normalize_services(config: dict) -> None:
     services = config.get("services")
     if not isinstance(services, list):
         return
+    # Preserve the raw per-service specs (engine, target_group, subnets, ...)
+    # before flattening — the generator reads them via service_instances.
+    if not config.get("service_instances"):
+        _raw_dicts = [e for e in services if isinstance(e, dict)]
+        if _raw_dicts:
+            config["service_instances"] = _raw_dicts
     normalized: list[str] = []
     for entry in services:
         if isinstance(entry, str):

@@ -169,6 +169,28 @@ STATIC_SERVICE_VARS: dict[str, list[dict]] = {
          "description": "DynamoDB billing mode: PROVISIONED or PAY_PER_REQUEST",
          "dev": "PAY_PER_REQUEST", "staging": "PAY_PER_REQUEST", "prod": "PROVISIONED"},
     ],
+    "autoscaling": [
+        {"name": "asg_instance_type", "type": "string",
+         "description": "EC2 instance type for the Auto Scaling Group",
+         "dev": "t3.micro", "staging": "t3.small", "prod": "m5.large"},
+        {"name": "asg_min_size", "type": "number",
+         "description": "Minimum number of instances in the ASG",
+         "dev": 1, "staging": 2, "prod": 2},
+        {"name": "asg_max_size", "type": "number",
+         "description": "Maximum number of instances in the ASG",
+         "dev": 2, "staging": 4, "prod": 6},
+        {"name": "asg_desired_capacity", "type": "number",
+         "description": "Desired number of instances in the ASG",
+         "dev": 1, "staging": 2, "prod": 2},
+    ],
+    "rds": [
+        {"name": "db_instance_class",    "type": "string",
+         "description": "RDS instance class",
+         "dev": "db.t3.micro", "staging": "db.t3.small", "prod": "db.m5.large"},
+        {"name": "db_allocated_storage", "type": "number",
+         "description": "RDS allocated storage in GB",
+         "dev": 20, "staging": 50, "prod": 100},
+    ],
     "alb": [
         {"name": "alb_idle_timeout", "type": "number",
          "description": "ALB connection idle timeout in seconds",
@@ -439,7 +461,44 @@ def generate_scaffold(
             dg._base_svc(svc, catalog) or svc
         )
         if lookup_key in STATIC_SERVICE_VARS:
-            dynamic_vars.extend(STATIC_SERVICE_VARS[lookup_key])
+            # Copy each var dict — env overrides below must not mutate the
+            # module-level defaults. Skip names already collected (e.g. a
+            # stack declaring both rds and mysql shares db_* vars).
+            for v in STATIC_SERVICE_VARS[lookup_key]:
+                if not any(d["name"] == v["name"] for d in dynamic_vars):
+                    dynamic_vars.append(dict(v))
+
+    # infra.yaml `environments.<env>.<svc>` sizing overrides the static per-env
+    # defaults above. Both layouts are accepted: flat ({instance_type: ...})
+    # and instance-named ({web-app-asg: {min_size: ...}}).
+    _ENV_OVERRIDE_KEYS = {
+        "autoscaling": {"instance_type":     "asg_instance_type",
+                        "min_size":          "asg_min_size",
+                        "max_size":          "asg_max_size",
+                        "desired_capacity":  "asg_desired_capacity"},
+        "ec2":         {"instance_type":     "ec2_instance_type",
+                        "instance_count":    "ec2_instance_count"},
+        "rds":         {"instance_class":    "db_instance_class",
+                        "allocated_storage": "db_allocated_storage"},
+        "alb":         {"idle_timeout":      "alb_idle_timeout"},
+    }
+    _vars_by_name = {v["name"]: v for v in dynamic_vars}
+    for _env_name, _env_cfg in (environments or {}).items():
+        if not isinstance(_env_cfg, dict):
+            continue
+        for _svc_type, _key_map in _ENV_OVERRIDE_KEYS.items():
+            _svc_cfg = _env_cfg.get(_svc_type)
+            if not isinstance(_svc_cfg, dict):
+                continue
+            _flat: dict = {}
+            for _k, _v in _svc_cfg.items():
+                if isinstance(_v, dict):
+                    _flat.update(_v)
+                else:
+                    _flat[_k] = _v
+            for _cfg_key, _var_name in _key_map.items():
+                if _cfg_key in _flat and _var_name in _vars_by_name:
+                    _vars_by_name[_var_name][_env_name] = _flat[_cfg_key]
 
     # "" provider.tf """""""""""""""""""""""""""""""""""""""""""""""""""""""
     _write_provider_tf(base, project_name, region, owner, catalog)
@@ -476,6 +535,23 @@ def generate_scaffold(
     ctx["alb_target_port"]       = alb_target_port
     ctx["alb_target_protocol"]   = str(_tg_spec.get("protocol", _tg_proto_default)).upper()
     ctx["alb_health_check_path"] = _tg_spec.get("health_check_path", "/health")
+
+    # ── RDS engine ──────────────────────────────────────────────────────────
+    # The rds template reads {{ db_engine }}; honour the infra.yaml
+    # rds.engine spec (service type mysql/postgres implies the engine).
+    _rds_spec = next(
+        (s for s in config.get("service_instances", [])
+         if isinstance(s, dict) and s.get("type") in ("rds", "mysql", "postgres")),
+        {},
+    )
+    _db_engine = str(_rds_spec.get("engine") or "").lower()
+    if _db_engine == "postgresql":
+        _db_engine = "postgres"
+    ctx["db_engine"] = _db_engine or "postgres"
+    # An engine named explicitly in infra.yaml must beat the catalog entry's
+    # extra_vars default (the generic 'rds' alias pins db_engine: postgres).
+    if _db_engine:
+        ctx["db_engine_override"] = _db_engine
     if needs_vpc:
         vpc_hcl = dg.generate_vpc_layer(catalog, project_name, region, owner, services)
         (base / "networking.tf").write_text(vpc_hcl, encoding="utf-8")
@@ -659,6 +735,9 @@ def generate_scaffold(
         if template:
             extra_vars = entry.get("extra_vars", {})
             merged     = {**ctx, **extra_vars}
+            # infra.yaml's explicit engine beats the catalog extra_vars default.
+            if merged.get("db_engine_override"):
+                merged["db_engine"] = merged["db_engine_override"]
             try:
                 hcl = jinja_env.get_template(template).render(**merged)
                 auto_vars = _write_service_module(modules_dir, svc, hcl)
@@ -1937,6 +2016,16 @@ variable "environment"        { type = string }
 variable "private_subnet_ids" { type = list(string) }
 variable "security_group_id"  { type = string }
 
+variable "instance_class" {
+  type    = string
+  default = "db.t3.micro"
+}
+
+variable "allocated_storage" {
+  type    = number
+  default = 20
+}
+
 variable "multi_az" {
   type    = bool
   default = false
@@ -1956,6 +2045,16 @@ variable "tags" {
 variable "environment"        { type = string }
 variable "private_subnet_ids" { type = list(string) }
 variable "security_group_id"  { type = string }
+
+variable "instance_class" {
+  type    = string
+  default = "db.t3.micro"
+}
+
+variable "allocated_storage" {
+  type    = number
+  default = 20
+}
 
 variable "multi_az" {
   type    = bool
@@ -2827,8 +2926,16 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
         f'  tags               = local.common_tags\n'
         f'}}\n'
     )
-    if svc in ("rds", "mysql", "postgres", "aurora-postgres", "aurora-mysql"):
+    if svc in ("aurora-postgres", "aurora-mysql"):
         return _DB_CALL
+    if svc in ("rds", "mysql", "postgres"):
+        # Non-aurora RDS also takes tfvars-driven sizing (db_* root vars).
+        return _DB_CALL.replace(
+            "  tags               = local.common_tags\n",
+            "  instance_class     = var.db_instance_class\n"
+            "  allocated_storage  = var.db_allocated_storage\n"
+            "  tags               = local.common_tags\n",
+        )
     if svc == "autoscaling":
         return (
             f'module "autoscaling" {{\n'
@@ -2839,6 +2946,10 @@ def _service_module_call(svc: str, extra_vars: list[str] | None = None) -> str:
             f'  kms_key_arn           = try(module.kms.key_arn, null)\n'
             f'  instance_profile_name = aws_iam_instance_profile.ec2.name\n'
             f'  target_group_arns     = compact([try(module.alb.target_group_arn, "")])\n'
+            f'  asg_instance_type     = var.asg_instance_type\n'
+            f'  asg_min_size          = var.asg_min_size\n'
+            f'  asg_max_size          = var.asg_max_size\n'
+            f'  asg_desired_capacity  = var.asg_desired_capacity\n'
             f'  tags                  = local.common_tags\n'
             f'}}\n'
         )

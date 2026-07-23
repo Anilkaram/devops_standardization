@@ -38,10 +38,10 @@ resource "aws_db_instance" "main" {
   identifier     = "{{ project_name }}-${var.environment}-rds"
   engine         = "{{ db_engine | default('postgres') }}"
   engine_version = "{{ '17' if db_engine == 'postgres' else '8.4' }}"
-  instance_class = var.environment == "prod" ? "db.t3.small" : "db.t3.micro"
+  instance_class = var.instance_class
 
-  allocated_storage     = 20
-  max_allocated_storage = 100   # storage autoscaling ceiling
+  allocated_storage     = var.allocated_storage
+  max_allocated_storage = var.allocated_storage * 5   # storage autoscaling ceiling
 
   db_name  = replace("{{ project_name }}", "-", "_")
   username = "dbadmin"
@@ -63,7 +63,8 @@ resource "aws_db_instance" "main" {
   auto_minor_version_upgrade = true            # CKV_AWS_226
 
   # Ship engine logs to CloudWatch (CKV_AWS_129)
-  enabled_cloudwatch_logs_exports = {{ '["postgresql", "upgrade"]' if db_engine != 'mysql' else '["audit", "error", "general", "slowquery"]' }}
+  {# mysql "audit" export needs the MariaDB audit plugin option group — omit it #}
+  enabled_cloudwatch_logs_exports = {{ '["postgresql", "upgrade"]' if db_engine != 'mysql' else '["error", "general", "slowquery"]' }}
 
   # Encryption at rest with CMK
   storage_encrypted = true
